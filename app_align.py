@@ -36,6 +36,7 @@ import cv2
 import numpy as np
 
 import capture_pair as cp
+from ui_common import wait_key
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -78,9 +79,20 @@ def fit_K(K, cal_size, real_size):
 
     正常情况下两边都是 640x480 / 1280x720，这个函数是道保险：
     比如以后改成 640x480 彩色取流，直接用 1280 的内参会把点全投到画面外。
+
+    ★ 参数必须是 (宽, 高)。曾经有调用方按 (高, 宽) 传进来，sw 算成 0.56，
+      彩色内参 fx 被压到一半，投影只覆盖画面左侧 2/3 —— 表现为"画面右侧
+      永远测不到深度"。所以这里做一次宽高比反号检测，传反了自动纠正。
     """
     if not cal_size or not real_size:
         return K
+    if len(cal_size) < 2 or len(real_size) < 2:
+        return K
+    # 宽高顺序反了：一边 w>h 另一边 w<h，几乎不可能是真的配置变化
+    if (real_size[0] > real_size[1]) != (cal_size[0] > cal_size[1]):
+        print(f"  ! fit_K: 分辨率顺序疑似传反 {real_size}（标定 {cal_size}），"
+              f"按 (宽,高) 纠正")
+        real_size = (real_size[1], real_size[0])
     sw = real_size[0] / float(cal_size[0])
     sh = real_size[1] / float(cal_size[1])
     if abs(sw - 1) < 1e-6 and abs(sh - 1) < 1e-6:
@@ -91,6 +103,19 @@ def fit_K(K, cal_size, real_size):
     K2[0, 2] *= sw
     K2[1, 2] *= sh
     return K2
+
+
+def adapt_cal(cal, depth_mode, color_mode):
+    """把内参适配到实际取流分辨率。
+
+    返回 (cal, dsz, csz)，其中 dsz/csz 是 **(高, 宽)**，给 Aligner / CloudBuilder 用。
+    fit_K 需要的是 (宽, 高)，两者的转换只在这一处做 —— 之前三个应用各自
+    传 (高, 宽) 进去，fx 被算成 0.56 倍，投影只覆盖画面左侧 2/3，
+    表现为"画面右边永远测不到深度"。
+    """
+    cal["K_d"] = fit_K(cal["K_d"], cal["size_d"], (depth_mode[0], depth_mode[1]))
+    cal["K_c"] = fit_K(cal["K_c"], cal["size_c"], (color_mode[0], color_mode[1]))
+    return cal, (depth_mode[1], depth_mode[0]), (color_mode[1], color_mode[0])
 
 
 class Aligner:
@@ -231,14 +256,13 @@ def main():
     color.start()
     print(f"深度 {depth.mode[0]}x{depth.mode[1]}   彩色 {color.mode[0]}x{color.mode[1]}")
     # 取流分辨率与标定分辨率不一致时按比例换算，避免点全投到画面外
-    cal["K_d"] = fit_K(cal["K_d"], cal["size_d"], (depth.mode[0], depth.mode[1]))
-    cal["K_c"] = fit_K(cal["K_c"], cal["size_c"], (color.mode[0], color.mode[1]))
+    cal, dsz, csz = adapt_cal(cal, depth.mode, color.mode)
     if cal["size_d"] and tuple(cal["size_d"]) != (depth.mode[0], depth.mode[1]):
         print(f"  ! 深度分辨率与标定不同（标定 {cal['size_d']}），已缩放内参")
     if cal["size_c"] and tuple(cal["size_c"]) != (color.mode[0], color.mode[1]):
         print(f"  ! 彩色分辨率与标定不同（标定 {cal['size_c']}），已缩放内参")
 
-    align = Aligner(cal, (depth.mode[1], depth.mode[0]), (color.mode[1], color.mode[0]))
+    align = Aligner(cal, dsz, csz)
 
     state = dict(mx=-1, my=-1, lock=False, mode=0, z=0.0)
     MODES = ("叠加 overlay", "并排 side-by-side", "仅深度 depth")
@@ -312,7 +336,7 @@ def main():
                         0.6, (200, 240, 200), 1, cv2.LINE_AA)
             cv2.imshow(win, canvas)
 
-            k = cv2.waitKey(1) & 0xFF
+            k = wait_key(win, 1)      # 点窗口 X 也能退出
             if k in (27, ord("q")):
                 break
             if k == ord("m"):

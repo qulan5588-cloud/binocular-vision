@@ -34,7 +34,8 @@ import cv2
 import numpy as np
 
 import capture_pair as cp
-from app_align import fit_K, latest_calib, load_calib
+from ui_common import wait_key
+from app_align import adapt_cal, latest_calib, load_calib
 from app_pointcloud import CloudBuilder, project_to_image, save_ply
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -212,10 +213,7 @@ def main():
         color = cp.ColorSource(idx, args.width, args.height, 30)
     color.start()
 
-    dsz = (depth.mode[1], depth.mode[0])
-    csz = (color.mode[1], color.mode[0])
-    cal["K_d"] = fit_K(cal["K_d"], cal["size_d"], dsz)
-    cal["K_c"] = fit_K(cal["K_c"], cal["size_c"], csz)
+    cal, dsz, csz = adapt_cal(cal, depth.mode, color.mode)
     builder = CloudBuilder(cal, dsz, csz)
 
     state = dict(drag=False, sx=0, sy=0, cx=0, cy=0, box=None, res=None,
@@ -292,7 +290,7 @@ def main():
                 break
 
             cv2.imshow(win, canvas)
-            k = cv2.waitKey(1) & 0xFF
+            k = wait_key(win, 1)      # 点窗口 X 也能退出
             if k in (27, ord("q")):
                 break
             if k == ord("r"):
