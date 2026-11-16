@@ -18,7 +18,7 @@ Orbbec Astra Pro Plus 是一台 RGB-D 一体相机，但厂方工具跑不出可
 ### 1.2 装依赖
 
 ```bash
-git clone <本仓库地址> && cd 双目视觉
+git clone <本仓库地址> && cd binocular-vision
 uv venv .venv                                   # 或 python -m venv .venv
 .venv/Scripts/activate                          # PowerShell: .venv\Scripts\Activate.ps1
 uv pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple

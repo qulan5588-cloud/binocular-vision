@@ -3,7 +3,10 @@
 import ctypes, os, sys
 from ctypes import c_void_p, c_int, c_char_p, c_uint16, c_uint64, POINTER, byref, Structure
 
-LIB_DIR = r"D:\双目视觉\_driver\openni2\OpenNI_2.3.0.86_202210111950_4c8f5aa4_beta6_windows\Win64-Release\sdk\libs"
+BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
+import capture_pair as _cp  # noqa: E402
+LIB_DIR = _cp.ONI_LIB_DIR
 os.add_dll_directory(LIB_DIR)
 
 class OniVideoMode(Structure):

@@ -7,8 +7,9 @@ import ctypes, os, sys, time, zlib, struct
 from ctypes import c_void_p, c_uint32, c_int, c_float, c_char_p, POINTER, byref
 import numpy as np
 
-VIEWER_DIR = r"D:\双目视觉\_driver\viewer"
-OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else r"D:\双目视觉\_detect"
+BASE = os.path.dirname(os.path.abspath(__file__))
+VIEWER_DIR = os.path.join(BASE, "_driver", "viewer")
+OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(BASE, "_detect")
 os.makedirs(OUT_DIR, exist_ok=True)
 os.add_dll_directory(VIEWER_DIR)
 
@@ -65,7 +66,7 @@ print("Orbbec Astra Pro Plus 深度流验证")
 print("=" * 60)
 
 e = c_void_p()
-CFG = r"D://双目视觉//_driver//viewer//OrbbecSDKConfig_v1.0.xml"
+CFG = os.path.join(VIEWER_DIR, "OrbbecSDKConfig_v1.0.xml")
 ctx = ob_create_context_with_config(CFG.encode(), byref(e))
 if not ctx:
     print("创建 context 失败:", err_text(e)); sys.exit(1)

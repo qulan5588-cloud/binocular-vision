@@ -6,9 +6,13 @@ import ctypes, os, sys, time, zlib, struct
 from ctypes import c_void_p, c_int, c_char_p, c_uint16, c_uint64, POINTER, byref, Structure
 import numpy as np
 
-LIB_DIR = r"D:\双目视觉\_driver\openni2\OpenNI_2.3.0.86_202210111950_4c8f5aa4_beta6_windows\Win64-Release\sdk\libs"
-OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else r"D:\双目视觉\_detect"
+BASE = os.path.dirname(os.path.abspath(__file__))
+OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(BASE, "_detect")
 os.makedirs(OUT_DIR, exist_ok=True)
+# 复用 capture_pair.py 的动态查找逻辑定位 OpenNI2.dll
+sys.path.insert(0, BASE)
+import capture_pair as _cp  # noqa: E402
+LIB_DIR = _cp.ONI_LIB_DIR
 os.add_dll_directory(LIB_DIR)
 
 ONI_API_VERSION = 2003
