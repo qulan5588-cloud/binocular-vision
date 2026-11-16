@@ -105,18 +105,15 @@ class _LineWriter(io.TextIOBase):
             self._buf = ""
 
 
-def apply_board(cols, rows, square_mm):
-    """把界面上的棋盘规格同步到标定模块。
+def apply_board(kind, cols, rows, square_mm):
+    """把界面上的标定板规格同步到标定模块。
 
-    calib_capture 与 calib_solve 共用 BOARD/PATTERN：检测用 PATTERN，几何用 BOARD，
-    OBJP 则是启动时按 BOARD 烘焙出来的常量。三处都改，才不会出现"检测按 9x6、
-    求解却按旧方格"的错位。
+    calib_capture 与 calib_solve 共用 BOARD/PATTERN：检测用 pattern()，几何用
+    BOARD，OBJP 则是按 BOARD 烘焙出来的常量。三处都改，才不会出现"检测按新板、
+    求解却按旧板"的错位。
     """
-    cols, rows = int(cols), int(rows)
-    cc.BOARD.update(cols=cols, rows=rows, square_mm=float(square_mm))
-    cc.PATTERN = (cols, rows)
-    cs.PATTERN = (cols, rows)
-    cs.OBJP = cs.board_points()
+    cc.set_board(kind, cols, rows, float(square_mm))
+    cs.refresh_objp()
 
 
 # 引导式标定的固定步骤表。cell 是 4x3 覆盖网格里的 (列, 行)，行 0 在上。
@@ -124,39 +121,208 @@ def apply_board(cols, rows, square_mm):
 # 顺序刻意排成"中心 → 四条边 → 四角 → 补倾斜"，每一步只改一个变量，
 # 用户手上动作最简单，也最容易看出哪一步卡住了。
 CALIB_STEPS = [
-    dict(cell=(1, 1), axis=None,  deg=0,  dist="0.6 m",
+    dict(cell=(1, 1), axis=None,  deg=0,  dist="mid",
          title="中心 · 正对", tip="这组定基准，决定整体尺度"),
-    dict(cell=(2, 1), axis=None,  deg=0,  dist="0.45 m",
+    dict(cell=(2, 1), axis=None,  deg=0,  dist="near",
          title="中心 · 靠近", tip="近距离样本，管住内参的近端"),
-    dict(cell=(1, 0), axis="pitch", deg=20, dist="0.6 m",
+    dict(cell=(1, 0), axis="pitch", deg=20, dist="mid",
          title="上边缘 · 向上仰", tip="板在上半幅并仰起，约束 fy 和主点 cy"),
-    dict(cell=(2, 0), axis="pitch", deg=20, dist="0.6 m",
+    dict(cell=(2, 0), axis="pitch", deg=20, dist="mid",
          title="上边缘 · 向上仰", tip="换一列再来一次，让上边缘两侧都有样本"),
-    dict(cell=(1, 2), axis="pitch", deg=-20, dist="0.6 m",
+    dict(cell=(1, 2), axis="pitch", deg=-20, dist="mid",
          title="下边缘 · 向下俯", tip="与上边缘对称，把 cy 的另一侧也压住"),
-    dict(cell=(2, 2), axis="pitch", deg=-20, dist="0.6 m",
+    dict(cell=(2, 2), axis="pitch", deg=-20, dist="mid",
          title="下边缘 · 向下俯", tip="下边缘另一列"),
-    dict(cell=(0, 1), axis="yaw", deg=30, dist="0.6 m",
+    dict(cell=(0, 1), axis="yaw", deg=30, dist="mid",
          title="左边缘 · 向左偏", tip="左侧加偏航，透视压缩最强烈，约束 fx 和 cx"),
-    dict(cell=(3, 1), axis="yaw", deg=-30, dist="0.6 m",
+    dict(cell=(3, 1), axis="yaw", deg=-30, dist="mid",
          title="右边缘 · 向右偏", tip="右侧加偏航，与左侧配成一对"),
-    dict(cell=(0, 0), axis=None, deg=0, dist="0.6 m",
+    dict(cell=(0, 0), axis=None, deg=0, dist="mid",
          title="左上角 · 正对", tip="角落样本，给径向畸变系数提供边界条件"),
-    dict(cell=(3, 0), axis=None, deg=0, dist="0.6 m",
+    dict(cell=(3, 0), axis=None, deg=0, dist="mid",
          title="右上角 · 正对", tip="角落样本"),
-    dict(cell=(0, 2), axis=None, deg=0, dist="0.6 m",
+    dict(cell=(0, 2), axis=None, deg=0, dist="mid",
          title="左下角 · 正对", tip="角落样本"),
-    dict(cell=(3, 2), axis=None, deg=0, dist="0.6 m",
+    dict(cell=(3, 2), axis=None, deg=0, dist="mid",
          title="右下角 · 正对", tip="角落样本，这一格最难摆，板别顶到边"),
-    dict(cell=(1, 1), axis=None, deg=0, dist="0.85 m",
+    dict(cell=(1, 1), axis=None, deg=0, dist="far",
          title="中心 · 退远", tip="远距离样本，管住内参的远端"),
-    dict(cell=(2, 1), axis="roll", deg=20, dist="0.6 m",
+    dict(cell=(2, 1), axis="roll", deg=20, dist="mid",
          title="中心 · 顺时针转", tip="滚转约束相机安装的旋转偏差"),
-    dict(cell=(1, 1), axis="roll", deg=-20, dist="0.6 m",
+    dict(cell=(1, 1), axis="roll", deg=-20, dist="mid",
          title="中心 · 逆时针转", tip="反向滚转，与上一步配成一对"),
 ]
 
 AXIS_TXT = {"yaw": "偏航", "pitch": "俯仰", "roll": "滚转", None: ""}
+
+# ---- 方案二：中间横带（推荐给"没有升降台"的场地）----
+# 现场痛点：没有升降台，把板举到上边缘或四角要挪凳子、垫书、再对高度，
+# 十几分钟过不了两三步，最后多半放弃标定。
+# 关键观察：桌面上左右挪是不费力的，只有"上下抬"才是体力活。而外参精度
+# 恰恰主要由"角点在画面上的横向跨度"决定（见下面 2026-11-16 的实测对比），
+# 所以只保留中间一条横带、把板在左/中/右之间挪，就能拿回几乎全部精度。
+#   _detect/pose_set_exp.py 实测（圆点板、0.3px 角点噪声、各 20 次重复，
+#   三套步骤表都直接从本文件读，只换姿态集）：
+#     全幅覆盖        旋转 0.14°（最差 0.48°） 平移 1.09mm
+#     中间横带 3 列   旋转 0.36°（最差 0.84°） 平移 0.83mm
+#     只摆中间        旋转 2.55°（最差 6.55°） 平移 1.51mm
+# 也就是说"只在中间"会把旋转解到 2°级 —— 0.5m 处偏 2.5° 就是 22mm 错位，
+# 深度贴彩色必然错边；横带 0.36° 在 0.5m 处约 3mm，够用。所以默认落在横带上。
+BAND_U = {"L": 0.22, "M": 0.50, "R": 0.78}
+BAND_HALF = 0.12        # 板心允许的横向偏差（归一化，约 ±154px @1280）
+
+CALIB_STEPS_BAND = [
+    dict(cell=None, u=BAND_U["M"], axis=None, deg=0, dist="mid",
+         title="中间 · 正对", tip="基准组：板心对准画面中央，板面正对镜头"),
+    dict(cell=None, u=BAND_U["L"], axis=None, deg=0, dist="mid",
+         title="偏左 · 正对", tip="往左挪，高度不用变 —— 桌面上平移就行"),
+    dict(cell=None, u=BAND_U["R"], axis=None, deg=0, dist="mid",
+         title="偏右 · 正对", tip="再挪到右边，这一格把横向覆盖拉开"),
+    dict(cell=None, u=BAND_U["M"], axis=None, deg=0, dist="near",
+         title="中间 · 靠近", tip="往回中间并往前送，用远近换尺度"),
+    dict(cell=None, u=BAND_U["M"], axis=None, deg=0, dist="far",
+         title="中间 · 退远", tip="退到最远档，和上一组配成尺度差"),
+    dict(cell=None, u=BAND_U["L"], axis="pitch", deg=20, dist="mid",
+         title="左侧 · 上缘后仰 20°", tip="左边不动，只把上缘往后推"),
+    dict(cell=None, u=BAND_U["R"], axis="pitch", deg=20, dist="mid",
+         title="右侧 · 上缘后仰 20°", tip="右边同样后仰，两侧都留倾斜样本"),
+    dict(cell=None, u=BAND_U["M"], axis="pitch", deg=25, dist="near",
+         title="中间 · 后仰 25° · 近", tip="大俯仰配近距离，倾斜信息最足"),
+    dict(cell=None, u=BAND_U["L"], axis="pitch", deg=-25, dist="mid",
+         title="左侧 · 上缘前俯 25°", tip="反向俯仰，与后仰那组配对"),
+    dict(cell=None, u=BAND_U["R"], axis="pitch", deg=-25, dist="mid",
+         title="右侧 · 上缘前俯 25°", tip="右边再来一次前俯"),
+    dict(cell=None, u=BAND_U["M"], axis="yaw", deg=30, dist="mid",
+         title="中间 · 左偏 30°", tip="绕竖轴转，透视压缩最强烈，约束 fx"),
+    dict(cell=None, u=BAND_U["M"], axis="yaw", deg=-30, dist="mid",
+         title="中间 · 右偏 30°", tip="反向偏航，与上一组配成一对"),
+    dict(cell=None, u=BAND_U["L"], axis="yaw", deg=-30, dist="near",
+         title="左侧 · 右偏 30° · 近", tip="边上加偏航，边角样本最有价值"),
+    dict(cell=None, u=BAND_U["R"], axis="yaw", deg=30, dist="near",
+         title="右侧 · 左偏 30° · 近", tip="右边对称来一次"),
+    dict(cell=None, u=BAND_U["M"], axis="roll", deg=20, dist="mid",
+         title="中间 · 顺时针转 20°", tip="板面内旋转，约束相机安装的滚转"),
+    dict(cell=None, u=BAND_U["M"], axis="roll", deg=-20, dist="mid",
+         title="中间 · 逆时针转 20°", tip="反向滚转，与上一组配成一对"),
+]
+
+# ---- 方案三：只摆中间（最省力，精度明显下降，默认不选）----
+# 板心一直留在画面正中，只改倾角和远近。实测外参旋转会解到 2°级（见上），
+# 0.5m 处约 22mm 错位 —— 只在"连左右挪都不可能"时才用。
+CALIB_STEPS_CENTER = [
+    dict(cell=None, u=None, axis=None, deg=0, dist="mid",
+         title="中间 · 正对", tip="基准组：板心对准画面中央，板面正对镜头"),
+    dict(cell=None, u=None, axis=None, deg=0, dist="near",
+         title="中间 · 靠近", tip="只往前送，别抬高度 —— 用远近换尺度"),
+    dict(cell=None, u=None, axis=None, deg=0, dist="far",
+         title="中间 · 退远", tip="退到最远档，和上一组配成尺度差"),
+    dict(cell=None, u=None, axis="pitch", deg=20, dist="mid",
+         title="中间 · 上缘后仰 20°", tip="位置别动，只把上缘往后推"),
+    dict(cell=None, u=None, axis="pitch", deg=-25, dist="mid",
+         title="中间 · 上缘前俯 25°", tip="反向俯仰，与上一组配对压住主点"),
+    dict(cell=None, u=None, axis="pitch", deg=35, dist="near",
+         title="中间 · 后仰 35° · 近", tip="大俯仰配近距离，倾斜信息最足"),
+    dict(cell=None, u=None, axis="yaw", deg=30, dist="mid",
+         title="中间 · 左偏 30°", tip="绕竖轴转，板心仍留在画面中间"),
+    dict(cell=None, u=None, axis="yaw", deg=-30, dist="mid",
+         title="中间 · 右偏 30°", tip="反向偏航，和上一组配成一对"),
+    dict(cell=None, u=None, axis="yaw", deg=40, dist="near",
+         title="中间 · 左偏 40° · 近", tip="大偏航配近距离"),
+    dict(cell=None, u=None, axis="roll", deg=20, dist="mid",
+         title="中间 · 顺时针转 20°", tip="板面内旋转，约束相机安装的滚转"),
+    dict(cell=None, u=None, axis="roll", deg=-20, dist="near",
+         title="中间 · 逆时针转 20°", tip="反向滚转，顺便换个距离"),
+    dict(cell=None, u=None, axis="pitch", deg=20, dist="far",
+         title="中间 · 后仰 20° · 远", tip="远距离再补一组倾斜，压住焦距"),
+]
+
+# 非覆盖方案的纵向范围（归一化 v）：不要求高度精确，只防"板飘到上下边顶掉"。
+ZONE_V = (0.28, 0.72)
+# "只摆中间"的横向范围
+CENTER_ZONE = (0.30, 0.70, ZONE_V[0], ZONE_V[1])
+
+PLANS = {"band": "中间横带", "center": "只摆中间", "cover": "全幅覆盖"}
+
+
+def in_step_area(st, u, v, cell):
+    """板当前位置满足这一步的目标区域吗。
+
+    cover  ：按 4x3 网格的格号精确比对；
+    band   ：纵向宽松（只防顶边），横向要落在目标列 ±BAND_HALF；
+    center ：横向纵向都只要求落在中间带。
+    cell 由调用方按 u/v 现算（抓取帧和预览帧各算一次，不能共用）。
+    """
+    if st.get("cell") is not None:
+        return cell == st["cell"]
+    if not ZONE_V[0] <= v <= ZONE_V[1]:
+        return False
+    if st.get("u") is None:
+        return CENTER_ZONE[0] <= u <= CENTER_ZONE[1]
+    return abs(u - st["u"]) <= BAND_HALF
+
+
+def cell_name(cell):
+    """4x3 网格里的格号 -> 人话。中间两格合并叫"中央"。
+
+    原先这份映射在界面和采集线程里各写了一遍，采集线程那份漏了中间两格，
+    落到 (1,1)/(2,1) 会说出"画面右边缘"这种错话 —— 提示指错方向，比不说
+    更耽误事。现在只有这一份。
+    """
+    c, r = cell
+    if (c, r) in ((1, 1), (2, 1)):
+        return "画面中央"
+    corner = {(0, 0): "左上角", (3, 0): "右上角",
+              (0, 2): "左下角", (3, 2): "右下角"}.get((c, r))
+    if corner:
+        return "画面" + corner
+    if r == 0:
+        return "画面上边缘" + ("偏左" if c == 1 else "偏右")
+    if r == 2:
+        return "画面下边缘" + ("偏左" if c == 1 else "偏右")
+    return "画面左边缘" if c == 0 else "画面右边缘"
+
+# 引导步骤里的距离档位按标定板展开。圆点板特征跨度只有 40mm（棋盘 200mm），
+# 必须靠得更近才占够像素，否则"板够大"这一关永远过不去。
+BOARD_DIST = {
+    "chess": dict(near="0.45 m", mid="0.6 m", far="0.85 m"),
+    "circles": dict(near="0.35 m", mid="0.45 m", far="0.60 m"),
+}
+
+# 板宽占画面比例的合格区间。圆点板特征跨度只有 40mm，按彩色 1280 宽、
+# fx≈1000 换算：0.45m 处约 6.9%、0.60m 处 5.2%、0.78m 处 4.1%。
+# 下限取 0.04 对应约 0.78m —— 覆盖引导最远档（0.60m）且留 30% 余量；
+# 再往下放会让板退到一两米外也算"够大"，角点精度就没保证了。
+BOARD_SIZE_MIN = {"chess": 0.20, "circles": 0.04}
+SIZE_MAX = 0.78
+
+
+def calib_steps(kind="chess", plan="cover"):
+    """按标定板类型和引导方案展开步骤表，把距离档位换成具体米数"""
+    d = BOARD_DIST.get(kind, BOARD_DIST["chess"])
+    table = {"center": CALIB_STEPS_CENTER,
+             "band": CALIB_STEPS_BAND}.get(plan, CALIB_STEPS)
+    return [dict(s, dist=d[s["dist"]]) for s in table]
+
+
+def _note_text(kind="chess", plan="band"):
+    """标定配置对话框底部的说明文字，随标定板类型/方案切换"""
+    if plan == "band":
+        head = (f"「中间横带」共 {len(CALIB_STEPS_BAND)} 步：板始终保持同一高度，\n"
+                "只在左/中/右之间平移，再叠加倾角和远近 —— 不用升降台。\n"
+                "画面里的竖带框的是**板心**（绿色点），不是整块板 —— 板比带宽\n"
+                "很正常，对齐绿点就行。实测外参旋转误差 0.36°（全幅覆盖 0.14°）。\n")
+    elif plan == "center":
+        head = (f"「只摆中间」共 {len(CALIB_STEPS_CENTER)} 步：板一直留在画面正中，\n"
+                "只改倾角和远近。最省力，但角点横向跨度为 0，外参旋转会解到\n"
+                "2.5°级（0.5m 处约 22mm 错位）—— 只在完全没法左右挪时用。\n")
+    else:
+        head = (f"「全幅覆盖」共 {len(CALIB_STEPS)} 步，顺序固定：中心 → 四条边 → 四角 → 补倾斜。\n"
+                "每步在画面和面板上标出该摆的位置；摆好、板静止后\n"
+                "点『采集本步』（或按空格）才会保存并进入下一步。\n")
+    if kind == "circles":
+        return head + ("圆点板填 OpenCV 的 patternSize：CGB-020 是 4 / 5，间距 20mm。\n"
+                       "板面只有棋盘的 1/5，站位要比棋盘近，按提示距离来。")
+    return head + "内角点数与方格边长必须与打印件一致。"
 
 
 class CalibWorker(threading.Thread):
@@ -171,7 +337,8 @@ class CalibWorker(threading.Thread):
     这样不会在手还没松开板的时候就把帧存进去。
     """
 
-    # 判定为"可用图像"的阈值
+    # 判定为"可用图像"的阈值（SIZE_MIN 默认对应棋盘格，
+    # 换成圆点板时在 __init__ 里按 BOARD_SIZE_MIN 覆盖）
     SIZE_MIN = 0.20        # 板宽占画面宽度的下限
     SIZE_MAX = 0.78        # 上限（太满容易顶边）
     STEADY_PX = 0.010      # 板中心连续帧抖动上限（归一化）
@@ -181,8 +348,15 @@ class CalibWorker(threading.Thread):
     # 超出下面的量，才算新姿态 —— 否则板不动也会被当成新的一组采进去，
     # 白占一张名额，还让求解退化（重投影残差漂亮但内参发散）。
     NOVEL_POS = 0.055      # 板中心位移（归一化，约 70px @1280）
-    NOVEL_SIZE = 0.045     # 板宽占画面比例的变化
+    NOVEL_SIZE = 0.045     # 板宽占画面比例的变化（上限，小尺寸板按比例收紧）
     NOVEL_ANG = 7.0        # 任一轴角度变化（度）
+
+    # 引导预览的检测宽度。缩图能把每帧检测压到 10ms 级，但圆点板很小 ——
+    # 彩色 720p、0.6m 处圆直径只有约 17px，缩到 760 宽后剩 10px，接近
+    # findCirclesGrid 的下限。实测（合成圆阵，圆径/噪声接近实物）：
+    #   ≤750mm 缩到 760 仍 6/6 全中，900mm 掉到 2/6
+    # 圆点板放宽到 900，多花的几毫秒换取余量。
+    DETECT_W = {"chess": 760, "circles": 900}
 
     def __init__(self, cfg, put):
         super().__init__(daemon=True)
@@ -207,7 +381,11 @@ class CalibWorker(threading.Thread):
         self._csv = None
 
         # ---- 引导 ----
-        self.steps = list(CALIB_STEPS)
+        kind = (self.cfg.get("board") or ("chess",))[0]
+        self.plan = self.cfg.get("plan", "cover")
+        self.steps = calib_steps(kind, self.plan)
+        self.SIZE_MIN = BOARD_SIZE_MIN.get(kind, self.SIZE_MIN)
+        self.detect_w = self.DETECT_W.get(kind, 760)
         self.step_idx = 0
         self.live = None             # 最近一次评估结果 dict
         # 采集完全由用户点按钮 / 按空格触发。这两项只用来告诉界面
@@ -257,30 +435,85 @@ class CalibWorker(threading.Thread):
 
     # ---------- 预览 + 实时评估 ----------
     def _estimate_pose(self, pts):
-        """由角点四边形估出三轴倾角（度）。
+        """由"物面坐标 -> 图像点"的投影拟合估三轴倾角（度，带正负）。
 
-        不需要内参：透视会让远侧边变短，长短边之比约等于 cosθ，
-        所以 θ ≈ arccos(min/max)。精度只到几度，用于"倾斜够不够"的
-        粗判完全够用 —— 数值会随板在画面里的位置漂一点，不作为硬门槛。
+        原理：板的平面成像近似为 A ≈ s·K·[r1 r2]，对仿射部分 A 做 SVD 后
+        σ2/σ1 就是透视压缩量（cos 倾角），压缩方向（V 的最小奇异向量）
+        决定是绕横轴还是竖轴转。
+
+        这么做的好处：不依赖"第几个点在第几行"，也不依赖点集凸包是
+        四边形 —— 非对称圆阵的凸包是六边形，用"矩形四角找最近点"会挑
+        错角。棋盘和圆点板走同一套几何。
+
+        符号另算：SVD 只给绝对值，±20° 会读成同一个数。而"只在中间摆"
+        的方案里，一对 ±倾斜 位置相同、尺寸相同，若角度也读成一样，新颖度
+        校验就会判"跟已采那组太像"，人怎么扭都过不去。所以再用单应矩阵的
+        分母行求"沿压缩轴往哪边变远"，给出正负：远端那一侧成像更小，方向
+        就代表板的哪条边贴近/远离相机。
+
+        精度只到几度，用于"倾斜够不够"的粗判完全够用，不作为硬门槛。
         """
-        rows, cols = cc.PATTERN[1], cc.PATTERN[0]
-        if cols < 3 or rows < 3:
+        p = pts.reshape(-1, 2).astype(np.float64)
+        obj = cs.OBJP[:, :2].astype(np.float64)
+        if len(p) != len(obj) or len(p) < 6:
+            return 0.0, 0.0, 0.0          # 物面坐标没跟上板型，不硬猜
+        X = np.hstack([obj, np.ones((len(obj), 1))])
+        sol, *_ = np.linalg.lstsq(X, p, rcond=None)
+        A = sol[:2].T                      # 2x2, 物面(mm) -> 图像(px)
+        try:
+            _U, S, Vt = np.linalg.svd(A)
+        except np.linalg.LinAlgError:
             return 0.0, 0.0, 0.0
-        p = pts.reshape(rows, cols, 2)
-        tl, tr, bl, br = p[0, 0], p[0, -1], p[-1, 0], p[-1, -1]
-        top = float(np.linalg.norm(tr - tl))
-        bot = float(np.linalg.norm(br - bl))
-        left = float(np.linalg.norm(bl - tl))
-        right = float(np.linalg.norm(br - tr))
-
-        def ang(a, b):
-            r = min(a, b) / max(a, b, 1e-6)
-            return float(np.degrees(np.arccos(np.clip(r, 0.0, 1.0))))
-
-        pitch = ang(top, bot)      # 上下边不等长 -> 绕横轴转
-        yaw = ang(left, right)     # 左右边不等长 -> 绕竖轴转
-        roll = float(np.degrees(np.arctan2(tr[1] - tl[1], tr[0] - tl[0])))
+        if S[0] < 1e-9 or S[1] < 1e-9:
+            return 0.0, 0.0, 0.0
+        tilt = float(np.degrees(np.arccos(np.clip(S[1] / S[0], 0.0, 1.0))))
+        v = Vt[1]                                    # 板坐标下的压缩方向
+        a = abs(np.degrees(np.arctan2(v[1], v[0])))
+        sgn = self._tilt_sign(obj, p, v)
+        tilt *= sgn
+        yaw, pitch = (tilt, 0.0) if a < 45.0 else (0.0, tilt)
+        ex = A @ np.array([1.0, 0.0])                # 板 x 轴在图像里的方向
+        roll = float(np.degrees(np.arctan2(ex[1], ex[0])))
+        if roll > 90.0:
+            roll -= 180.0
+        elif roll < -90.0:
+            roll += 180.0
         return yaw, pitch, roll
+
+    @staticmethod
+    def _tilt_sign(obj, p, vdir):
+        """沿压缩轴哪一头更远（+1/-1）。远端成像更小，用单应矩阵判定。
+
+        单应 H 满足 [u,v,w]ᵀ = H·[x,y,1]ᵀ，其中 w 是相机系深度（正比），
+        所以 d w/ds = (H20, H21)·vdir 的符号就说明沿 vdir 走是变远还是变近。
+        H 差一个尺度，先把 w 在板心处校成正值，符号才有意义。
+
+        vdir 来自 SVD，本身差一个正负号（LAPACK 只保证正交），必须先把
+        它规整到"主分量朝正"再算 —— 否则同一块板在两个距离上会读出相反的
+        符号，±倾斜又变成分不开。
+        """
+        vd = np.array(vdir, dtype=float)
+        if abs(vd[0]) >= abs(vd[1]):
+            if vd[0] < 0:
+                vd = -vd
+        elif vd[1] < 0:
+            vd = -vd
+        try:
+            H, _ = cv2.findHomography(
+                obj.astype(np.float32), p.astype(np.float32), 0)
+        except cv2.error:
+            return 1.0
+        if H is None or not np.all(np.isfinite(H)):
+            return 1.0
+        c = obj.mean(axis=0)
+        w0 = float(H[2, 0] * c[0] + H[2, 1] * c[1] + H[2, 2])
+        if abs(w0) < 1e-12:
+            return 1.0
+        if w0 < 0:                        # 尺度不定，翻成"板心 w>0"
+            H = -H
+            w0 = -w0
+        g = float(H[2, 0] * vd[0] + H[2, 1] * vd[1])
+        return 1.0 if g >= 0 else -1.0
 
     def _summary(self, cpts, w, h):
         """从全分辨率角点算一组姿态摘要：位置、占宽比、三轴倾角"""
@@ -306,13 +539,32 @@ class CalibWorker(threading.Thread):
         for t in self.taken:
             dp = dict(h=abs(L.get("u", 0.0) - t["u"]) / self.NOVEL_POS,
                       v=abs(L.get("v", 0.0) - t["v"]) / self.NOVEL_POS)
-            ds = abs(L.get("size", 0.0) - t["size"]) / self.NOVEL_SIZE
+            ds = abs(L.get("size", 0.0) - t["size"]) / self._size_eps(
+                L.get("size", 0.0), t["size"])
             da = max(abs(L.get(a, 0.0) - t[a])
                      for a in ("yaw", "pitch", "roll")) / self.NOVEL_ANG
             g = max(dp["h"], dp["v"], ds, da)
             if best is None or g < best[0]:
                 best = (g, dict(pos=dp, size=ds, ang=da, ref=t))
         return best[0] >= 1.0, best[0], best[1]
+
+    def _size_eps(self, a, b):
+        """尺寸维度的"算不同"阈值。
+
+        NOVEL_SIZE 是按棋盘（占宽 0.30~0.40）定的绝对值。圆点板只占 5%~9%，
+        用同一个绝对值等于要求"尺寸变化接近一倍"，这一维就形同失效 ——
+        而引导第 13 步（中心·退远）恰恰只靠距离变化，会被判成"跟已采太像"
+        永远采不进去。所以尺寸阈值随板本身的大小收紧，取两者较小：
+        棋盘仍走 0.045（不变），圆点板约 0.014（0.45m→0.60m 差值 0.017 生效）。
+
+        中间带方案再收紧一档（20%→13%）：位置维度在方案里恒为 0，剩下能
+        拉开差距的只有"倾角"和"远近"两项，尺寸这一维就成了主力。按 20%
+        算，0.45m→0.35m 的尺寸差只到 1.1 倍阈值，手一抖就掉回"太像"，
+        人明明照做了却过不去。横带同理（那里同一列上也会连着采 near/far）。
+        """
+        frac = {"cover": 0.20, "band": 0.15}.get(
+            getattr(self, "plan", "cover"), 0.13)
+        return min(self.NOVEL_SIZE, frac * max(a, b, 1e-6))
 
     def _evaluate(self, cok, cpts, iok, ipts, shape):
         h, w = shape[0], shape[1]
@@ -328,10 +580,13 @@ class CalibWorker(threading.Thread):
             self._hist.append((now, u, v))
             L["novel"], L["gap"], L["gapdims"] = self._novelty(L)
         elif iok and self.ir is not None:
-            # 彩色暂时没检出时，用 IR 的位置兜底，界面照样能提示往哪边挪
+            # 彩色暂时没检出时，用 IR 的位置兜底，界面照样能提示往哪边挪。
+            # 注意 Astra 的 IR 流是水平镜像的（与 calib_solve 同一已知特性），
+            # u 必须翻回来，否则箭头/提示会指着反方向。
             p = ipts.reshape(-1, 2)
             iw, ih = self.ir.mode[0], self.ir.mode[1]
-            u, v = float(p[:, 0].mean()) / iw, float(p[:, 1].mean()) / ih
+            u = 1.0 - float(p[:, 0].mean()) / iw
+            v = float(p[:, 1].mean()) / ih
             L.update(u=u, v=v, src="ir",
                      cell=(min(3, max(0, int(u * 4))), min(2, max(0, int(v * 3)))))
         # 稳定性只看最近 stable_sec 内的帧。板一旦移出画面就不再追加，
@@ -365,7 +620,8 @@ class CalibWorker(threading.Thread):
         # 真正抓取时 _grab_once 还是用全分辨率，精度不受影响。
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
-        sc = 760.0 / w if w > 760 else 1.0
+        dw = float(self.detect_w)
+        sc = dw / w if w > dw else 1.0
         small = (cv2.resize(gray, None, fx=sc, fy=sc,
                             interpolation=cv2.INTER_AREA) if sc < 1.0 else gray)
         cok, cpts = cc.detect_corners(small)
@@ -379,23 +635,51 @@ class CalibWorker(threading.Thread):
         self.last = (vis_i, vis_c)
 
     def _overlay(self, vis):
-        """画面叠加：目标区域框 + 板当前中心 + 指向箭头，右下角另附覆盖网格"""
+        """画面叠加：目标区域 + 板当前中心 + 指向箭头，右下角另附进度
+
+        三种方案的"目标区域"画法不同：覆盖方案画格子角括号，横带画一条
+        竖向虚线带（只约束左右），只摆中间画一个中间虚线框。
+        """
         h, w = vis.shape[0], vis.shape[1]
         L = self.live or {}
         n = len(self.steps)
         if self.step_idx < n:
-            c, r = self.steps[self.step_idx]["cell"]
-            cx, cy = (c + 0.5) * w / 4.0, (r + 0.5) * h / 3.0
-            x1, y1 = int(c * w / 4), int(r * h / 3)
-            x2, y2 = int((c + 1) * w / 4) - 1, int((r + 1) * h / 3) - 1
+            st = self.steps[self.step_idx]
             col = (60, 190, 255)          # BGR 琥珀，和界面强调色一致
             ln = max(16, int(min(w, h) * 0.055))
-            # 只画四个角括号：板本身不被画花，位置范围却一眼可见
-            for px, py, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1),
-                                   (x1, y2, 1, -1), (x2, y2, -1, -1)):
-                cv2.line(vis, (px, py), (px + dx * ln, py), col, 2)
-                cv2.line(vis, (px, py), (px, py + dy * ln), col, 2)
-            cv2.drawMarker(vis, (int(cx), int(cy)), col, cv2.MARKER_CROSS, 24, 1)
+            if st["cell"] is None:
+                # 横带/只摆中间：画"板心带"——两条通高竖虚线 + 淡淡的竖条。
+                # 绝不画闭合矩形：判定只看板心，而板在要求距离上往往比带宽
+                # 更宽，闭合框会让人误以为"整块板要放进框里"，怎么摆都进不去。
+                tu = st.get("u")
+                if tu is None:
+                    u0, u1 = CENTER_ZONE[0], CENTER_ZONE[1]
+                else:
+                    u0, u1 = tu - BAND_HALF, tu + BAND_HALF
+                x1, x2 = int(u0 * w), int(u1 * w)
+                ov = vis.copy()
+                cv2.rectangle(ov, (x1, 0), (x2, h), col, -1)
+                cv2.addWeighted(ov, 0.10, vis, 0.90, 0, vis)
+                for x in (x1, x2):
+                    for y in range(0, h, 34):
+                        cv2.line(vis, (x, y), (x, min(y + 22, h)), col, 2)
+                cv2.putText(vis, "board-center band", (x1 + 6, 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1,
+                            cv2.LINE_AA)
+                cy = int(float(L.get("v", 0.5)) * h) if L.get("cok") else h // 2
+                cx = (x1 + x2) // 2
+            else:
+                c, r = st["cell"]
+                cx, cy = (c + 0.5) * w / 4.0, (r + 0.5) * h / 3.0
+                x1, y1 = int(c * w / 4), int(r * h / 3)
+                x2, y2 = int((c + 1) * w / 4) - 1, int((r + 1) * h / 3) - 1
+                # 只画四个角括号：板本身不被画花，位置范围却一眼可见
+                for px, py, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1),
+                                       (x1, y2, 1, -1), (x2, y2, -1, -1)):
+                    cv2.line(vis, (px, py), (px + dx * ln, py), col, 2)
+                    cv2.line(vis, (px, py), (px, py + dy * ln), col, 2)
+                cv2.drawMarker(vis, (int(cx), int(cy)), col,
+                               cv2.MARKER_CROSS, 24, 1)
             u, v = L.get("u"), L.get("v")
             if u is not None and (L.get("cok") or L.get("src") == "ir"):
                 px, py = int(u * w), int(v * h)
@@ -406,22 +690,37 @@ class CalibWorker(threading.Thread):
                         cv2.arrowedLine(vis, (px, py), (int(cx), int(cy)),
                                         (255, 255, 255), 2, tipLength=0.16)
 
-        # 右下角 4x3 网格：绿=已采，亮框=当前该摆的格
-        s, g = 11, 3
-        x0 = w - 4 * (s + g) - 10
-        y0 = h - 3 * (s + g) - 22
-        tgt = self.steps[self.step_idx]["cell"] if self.step_idx < n else None
-        for ry in range(3):
-            for cx in range(4):
-                x, y = x0 + cx * (s + g), y0 + ry * (s + g)
-                on = (cx, ry) in self.cells
-                if (cx, ry) == tgt:
-                    cv2.rectangle(vis, (x - 1, y - 1), (x + s + 1, y + s + 1),
+        if self.plan != "cover":
+            # 非覆盖方案没有"覆盖哪几格"可言，进度按步数点阵显示
+            s, g = 9, 3
+            x0 = w - n * (s + g) - 10
+            y0 = h - s - 24
+            for i in range(n):
+                x = x0 + i * (s + g)
+                if i == self.step_idx:
+                    cv2.rectangle(vis, (x - 1, y0 - 1), (x + s + 1, y0 + s + 1),
                                   (60, 190, 255), 1)
-                cv2.rectangle(vis, (x, y), (x + s, y + s),
-                              (110, 220, 140) if on else (58, 66, 80), -1)
-        cv2.putText(vis, f"cover {len(self.cells)}/12", (x0 - 2, y0 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 165, 185), 1)
+                cv2.rectangle(vis, (x, y0), (x + s, y0 + s),
+                              (110, 220, 140) if i < self.saved else (58, 66, 80), -1)
+            cv2.putText(vis, f"step {self.saved}/{n}", (x0 - 2, y0 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 165, 185), 1)
+        else:
+            # 右下角 4x3 网格：绿=已采，亮框=当前该摆的格
+            s, g = 11, 3
+            x0 = w - 4 * (s + g) - 10
+            y0 = h - 3 * (s + g) - 22
+            tgt = self.steps[self.step_idx]["cell"] if self.step_idx < n else None
+            for ry in range(3):
+                for cx in range(4):
+                    x, y = x0 + cx * (s + g), y0 + ry * (s + g)
+                    on = (cx, ry) in self.cells
+                    if (cx, ry) == tgt:
+                        cv2.rectangle(vis, (x - 1, y - 1), (x + s + 1, y + s + 1),
+                                      (60, 190, 255), 1)
+                    cv2.rectangle(vis, (x, y), (x + s, y + s),
+                                  (110, 220, 140) if on else (58, 66, 80), -1)
+            cv2.putText(vis, f"cover {len(self.cells)}/12", (x0 - 2, y0 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 165, 185), 1)
 
     # ---------- 采一组 ----------
     def _grab_once(self, forced=False):
@@ -505,7 +804,9 @@ class CalibWorker(threading.Thread):
         st = self.steps[min(self.step_idx, len(self.steps) - 1)]
         L = self.live or {}
         s = dict(color=bool(L.get("cok")), ir=bool(L.get("iok")),
-                 pos=(L.get("cell") == st["cell"]), size=False, tilt=True,
+                 pos=in_step_area(st, L.get("u", -1.0), L.get("v", -1.0),
+                                  L.get("cell")),
+                 size=False, tilt=True,
                  moved=bool(L.get("novel", not self.taken)))
         if not (s["color"] and s["ir"]):
             return st, s, False
@@ -542,10 +843,10 @@ class CalibWorker(threading.Thread):
         """
         st = self.steps[min(self.step_idx, len(self.steps) - 1)]
         if sm is None:
-            return "没检出棋盘格：把板移到画面中间、正对镜头"
+            return "没检出标定板：把板移到画面中间、正对镜头"
         cell = (min(3, max(0, int(sm["u"] * 4))), min(2, max(0, int(sm["v"] * 3))))
-        if cell != st["cell"]:
-            return f"板不在{self._cell_name(st['cell'])}：先按提示挪到目标位置"
+        if not in_step_area(st, sm["u"], sm["v"], cell):
+            return f"板不在{self._step_where(st)}：先按提示挪到目标位置"
         if sm["size"] < self.SIZE_MIN:
             return "板太小：靠近一些再采"
         if sm["size"] > self.SIZE_MAX:
@@ -558,28 +859,34 @@ class CalibWorker(threading.Thread):
         return None
 
     @staticmethod
-    def _cell_name(cell):
-        corner = {(0, 0): "左上角", (3, 0): "右上角",
-                  (0, 2): "左下角", (3, 2): "右下角"}.get(cell)
-        if corner:
-            return "画面" + corner
-        c, r = cell
-        if r == 0:
-            return "画面上边缘" + ("偏左" if c == 1 else "偏右")
-        if r == 2:
-            return "画面下边缘" + ("偏左" if c == 1 else "偏右")
-        return "画面左边缘" if c == 0 else "画面右边缘"
+    def _step_where(st):
+        """这一步该把板摆在哪：横带按列名，只摆中间固定，覆盖按格号"""
+        if st.get("cell") is not None:
+            return cell_name(st["cell"])
+        u = st.get("u")
+        if u is None:
+            return "画面中间带"
+        return "画面偏左那一列" if u < 0.4 else (
+            "画面偏右那一列" if u > 0.6 else "画面中间那一列")
 
     def _similar_reason(self, st, dims, gap=0.0):
         """与已采组太像时，指出最该改变的那个维度"""
         pos = dims.get("pos") or {}
-        weakest = min((pos.get("h", 9.0), "h"), (pos.get("v", 9.0), "v"),
-                      (dims.get("size", 9.0), "size"),
-                      (dims.get("ang", 9.0), "ang"))[1]
+        if self.plan == "center":
+            # 中间带方案下位置本来就是固定的，位置差恒为 0；拿它当"最该改
+            # 的维度"会让人把板往边上挪 —— 恰好是这一步不该做的事。
+            cands = [(dims.get("size", 9.0), "size"), (dims.get("ang", 9.0), "ang")]
+        else:
+            cands = [(pos.get("h", 9.0), "h"), (pos.get("v", 9.0), "v"),
+                     (dims.get("size", 9.0), "size"),
+                     (dims.get("ang", 9.0), "ang")]
+        weakest = min(cands)[1]
         if st["axis"] and weakest in ("ang", "h", "v"):
             return f"跟已采那组太像：{AXIS_TXT[st['axis']]}再转大一些"
         if weakest == "size":
             return f"跟已采那组太像：把板移到约 {st['dist']} 再采"
+        if self.plan == "center":
+            return f"跟已采那组太像：{AXIS_TXT[st['axis']] if st['axis'] else '倾角'}再明显一些"
         return "跟已采那组太像：把板挪开半格以上"
 
     def _row(self, values):
@@ -928,6 +1235,10 @@ class CameraApp:
         self.lbl_cov = tk.Label(top, text="覆盖 0/12", font=(MONO, -11),
                                 fg=C_DIM, bg=C_CARD, anchor="e")
         self.lbl_cov.pack(side="right")
+        # 当前用的是哪种板：换板后数字会变，写在面板上避免"拿错板还在找原因"
+        self.lbl_board = tk.Label(top, text="", font=(FT, -10),
+                                  fg=C_SUB, bg=C_CARD)
+        self.lbl_board.pack(side="left", padx=(8, 0))
 
         self.cv_step = tk.Canvas(wk, width=290, height=163, bg=C_CANVAS,
                                  highlightthickness=1,
@@ -987,7 +1298,7 @@ class CameraApp:
         self.pb = ttk.Progressbar(s2b, style="Calib.Horizontal.TProgressbar",
                                   mode="determinate", maximum=100)
         self.pb.pack(fill="x", pady=(8, 0))
-        self.lbl_calib = tk.Label(s2b, text="15 步引导：每步给出摆位提示，位置和图像达标自动采集",
+        self.lbl_calib = tk.Label(s2b, text="15 步引导：可选棋盘格或圆点板，按提示摆位后手动确认采集",
                                   font=(FT, -10), fg=C_DIM, bg=C_CARD,
                                   anchor="w", justify="left", wraplength=290)
         self.lbl_calib.pack(fill="x", pady=(5, 0))
@@ -1487,6 +1798,17 @@ class CameraApp:
         self.lbl_wiz.configure(text="正在启动 IR + 彩色流 …", fg=C_SUB)
         self.pb_step["value"] = 0
 
+        # 采集阶段就要用对板型：detect_corners 按 BOARD["kind"] 分派，OBJP 也要
+        # 跟着重烘焙（预览里的倾角估计靠它）。之前只在 _solve() 里 apply，
+        # 结果选圆点板进去仍按棋盘检测，预览永远"没检到标定板"。
+        apply_board(*cfg["board"])
+        self.log(f"标定板：{cc.board_label()}")
+        self.log(f"摆放方案：{PLANS.get(cfg.get('plan'), '全幅覆盖')}"
+                 f"（{cfg.get('poses', len(CALIB_STEPS))} 步）")
+        b = cc.BOARD
+        self.lbl_board.configure(
+            text=f"{'圆点板' if b['kind'] == 'circles' else '棋盘格'} "
+                 f"{b['cols']}×{b['rows']}·{b['square_mm']:g}mm")
         self.log("进入标定模式：关闭深度流，切换为 IR + 彩色")
         self._teardown_camera()
         self.calib = CalibWorker(cfg, self._logq.put)
@@ -1503,49 +1825,51 @@ class CameraApp:
 
     # ------------------------------------------------------ 引导标定 UI ---
     @staticmethod
-    def _where(cell):
-        c, r = cell
-        if (c, r) in ((1, 1), (2, 1)):
-            return "画面中央"
-        corner = {(0, 0): "左上角", (3, 0): "右上角",
-                  (0, 2): "左下角", (3, 2): "右下角"}.get((c, r))
-        if corner:
-            return "画面" + corner
-        if r == 0:
-            return "画面上边缘" + ("偏左" if c == 1 else "偏右")
-        if r == 2:
-            return "画面下边缘" + ("偏左" if c == 1 else "偏右")
-        return "画面左边缘" if c == 0 else "画面右边缘"
-
-    @staticmethod
-    def _tilt_txt(axis):
+    def _tilt_txt(axis, deg):
+        """倾斜动作的人话描述，角度跟着步骤走（步骤表里有 20/25/30/35/40°）"""
+        d = abs(int(deg))
         return {
-            "yaw": ("绕竖轴向左偏 30°", "绕竖轴向右偏 30°"),
-            "pitch": ("上缘向后仰 20°", "上缘向前俯 20°"),
-            "roll": ("顺时针转 20°", "逆时针转 20°"),
+            "yaw": (f"绕竖轴向左偏 {d}°", f"绕竖轴向右偏 {d}°"),
+            "pitch": (f"上缘向后仰 {d}°", f"上缘向前俯 {d}°"),
+            "roll": (f"顺时针转 {d}°", f"逆时针转 {d}°"),
         }[axis]
 
     def _step_do(self, st):
         if st["axis"]:
-            a, b = self._tilt_txt(st["axis"])
+            a, b = self._tilt_txt(st["axis"], st["deg"])
             hint = a if st["deg"] > 0 else b
         else:
             hint = "正对镜头，不要歪"
-        return f"{self._where(st['cell'])}，{hint}，距离约 {st['dist']}"
+        where = "画面中间" if st.get("cell") is None else cell_name(st["cell"])
+        if st.get("cell") is None and st.get("u") is not None:
+            where = "画面偏左" if st["u"] < 0.4 else (
+                "画面偏右" if st["u"] > 0.6 else "画面中间")
+        return f"{where}，{hint}，距离约 {st['dist']}"
 
     def _step_hint(self, s, st, w):
         L = w.live or {}
         if not s["color"] and not s["ir"]:
-            return "没检到棋盘格：把板移到画面中间，正对镜头"
+            return "没检到标定板：把板移到画面中间，正对镜头"
         if not s["color"] or not s["ir"]:
             bad = "彩色" if not s["color"] else "IR"
             return f"{bad}没检出：看看是不是板顶到边了，或光照太偏"
-        cell = L.get("cell")
-        if cell and cell != st["cell"]:
-            dc, dr = st["cell"][0] - cell[0], st["cell"][1] - cell[1]
-            mv = ("往左" if dc < 0 else "往右" if dc > 0 else "") + \
-                 ("往上" if dr < 0 else "往下" if dr > 0 else "")
-            return f"位置偏了，{mv}挪一些"
+        if not s["pos"]:
+            if st.get("cell") is not None:
+                cell = L.get("cell") or (0, 1)
+                dc = st["cell"][0] - cell[0]
+                dr = st["cell"][1] - cell[1]
+                mv = ("往左" if dc < 0 else "往右" if dc > 0 else "") + \
+                     ("往上" if dr < 0 else "往下" if dr > 0 else "")
+                return f"位置偏了，{mv}挪一些"
+            du = L.get("u", 0.5) - st["u"] if st.get("u") is not None else \
+                L.get("u", 0.5) - 0.5
+            dv = L.get("v", 0.5) - sum(ZONE_V) / 2
+            # v 向下为正：板比目标低（dv>0）就得往上挪
+            mv = ("往左" if du > 0.02 else "往右" if du < -0.02 else "") + \
+                 ("往上" if dv > 0.04 else "往下" if dv < -0.04 else "")
+            if st.get("u") is None:
+                return f"板心不在中间带里：{mv or '往中间'}挪一点（看绿点，板可以比带宽）"
+            return f"板心不在目标竖带里，{mv}挪一些（板大没关系，对齐绿点即可）"
         if L.get("size", 0.0) < w.SIZE_MIN:
             return "板太小，靠近一点"
         if L.get("size", 1.0) > w.SIZE_MAX:
@@ -1565,9 +1889,12 @@ class CameraApp:
         x0, y0, W, H = 6, 6, 278, 156
         cv.create_rectangle(x0 - 1, y0 - 1, x0 + W + 1, y0 + H + 1,
                             fill="#07090d", outline=C_LINE)
-        cw, ch = W / 4.0, H / 3.0
         st = w.steps[min(w.step_idx, len(w.steps) - 1)]
         L = w.live or {}
+        if getattr(w, "plan", "cover") != "cover":
+            self._draw_diagram_zone(cv, w, st, L, x0, y0, W, H)
+            return
+        cw, ch = W / 4.0, H / 3.0
         # 板当前落在哪一格：画个黄点，用户一眼能看出"我在哪、要去哪"
         now_cell = L.get("cell") if (L.get("cok") or L.get("src") == "ir") else None
         for r in range(3):
@@ -1588,30 +1915,106 @@ class CameraApp:
                     cv.create_text(gx + cw - 9, gy + 9, text="✓",
                                    fill="#3ddc9a", font=(FT, -9))
                 if cur:
-                    bx, by = gx + cw / 2, gy + ch / 2 - 4
-                    bw, bh = 36, 22
-                    cv.create_rectangle(bx - bw / 2, by - bh / 2,
-                                        bx + bw / 2, by + bh / 2,
-                                        fill="#eef3fa", outline="#8fa0b8")
-                    cwn, chn = bw / 3.0, bh / 2.0
-                    for i in range(3):
-                        for j in range(2):
-                            if (i + j) % 2 == 0:
-                                cv.create_rectangle(
-                                    bx - bw / 2 + i * cwn, by - bh / 2 + j * chn,
-                                    bx - bw / 2 + (i + 1) * cwn,
-                                    by - bh / 2 + (j + 1) * chn,
-                                    fill="#3a4a5e", outline="")
+                    self._draw_board_icon(cv, gx + cw / 2, gy + ch / 2 - 8)
                     if st["axis"]:
-                        cv.create_text(bx, gy + ch - 9,
+                        cv.create_text(gx + cw / 2, gy + ch - 9,
                                        text=f"{AXIS_TXT[st['axis']]} {st['deg']:+d}°",
                                        fill=C_WARN, font=(FT, -9))
                 if now_cell == (c, r):
-                    # 当前板位置：右下角黄点（目标格内则画在棋盘块旁边）
+                    # 当前板位置：右下角黄点（目标格内则画在标记块旁边）
                     px = gx + cw - 10 if not cur else gx + 12
                     py = gy + ch - 10 if not cur else gy + 12
                     cv.create_oval(px - 5, py - 5, px + 5, py + 5,
                                    fill=C_WARN, outline="#2a1c00")
+
+    def _draw_diagram_zone(self, cv, w, st, L, x0, y0, W, H):
+        """非覆盖方案的示意：整幅画面 + 板心竖带 + 当前板心 + 步骤进度。
+
+        覆盖方案那张 4x3 网格在这里没有意义（横带方案每一步都在中间那一行，
+        只摆中间方案连列都不变），换成"板心竖带 + 步骤条"。竖带画通高：
+        判定只看板心，板本身常常比带宽，画闭合框会让人误以为要把整块板
+        塞进框里（现场实际发生过）。绿=已采、亮框=当前，一眼看出还差几步。
+        """
+        n = len(w.steps)
+        cv.create_rectangle(x0, y0, x0 + W, y0 + H, outline="#232d3b")
+        tu = st.get("u")
+        if tu is None:
+            zones, cur = [(CENTER_ZONE[0], CENTER_ZONE[1])], 0
+        else:
+            zones = [(u - BAND_HALF, u + BAND_HALF) for u in BAND_U.values()]
+            cur = min(range(len(zones)), key=lambda i: abs(
+                (zones[i][0] + zones[i][1]) / 2 - tu))
+        for i, (a, b) in enumerate(zones):
+            xa, xb = x0 + a * W, x0 + b * W
+            on = i == cur
+            cv.create_rectangle(xa, y0, xb, y0 + H,
+                                fill="#1a2740" if on else "",
+                                outline=C_ACCENT if on else "#2a3546",
+                                dash=(4, 4) if on else None,
+                                width=2 if on else 1)
+        v0, v1 = ZONE_V
+        zx1, zx2 = x0 + zones[cur][0] * W, x0 + zones[cur][1] * W
+        self._draw_board_icon(cv, (zx1 + zx2) / 2, y0 + (v0 + v1) / 2 * H)
+        cv.create_text(zx1 + 3, y0 + 11, text="板心带", fill=C_ACCENT,
+                       font=(FT, -9), anchor="w")
+        # 板心实际落点：在目标带里=绿点，出带=黄点
+        if L.get("cok") or L.get("src") == "ir":
+            pu, pv = float(L.get("u", 0.5)), float(L.get("v", 0.5))
+            px, py = x0 + pu * W, y0 + pv * H
+            inside = zones[cur][0] <= pu <= zones[cur][1] and v0 <= pv <= v1
+            cv.create_oval(px - 5, py - 5, px + 5, py + 5,
+                           fill=C_OK if inside else C_WARN, outline="#2a1c00")
+        if st["axis"]:
+            cv.create_text(x0 + 8, y0 + 11,
+                           text=f"{AXIS_TXT[st['axis']]} {st['deg']:+d}°  {st['dist']}",
+                           fill=C_WARN, font=(FT, -10), anchor="w")
+        else:
+            cv.create_text(x0 + 8, y0 + 11, text=f"正对  {st['dist']}",
+                           fill=C_SUB, font=(FT, -10), anchor="w")
+        s, g = 8, 2
+        by = y0 + H - s - 4
+        for i in range(n):
+            x = x0 + 5 + i * (s + g)
+            done, is_cur = i < w.step_idx, i == w.step_idx
+            fill = "#123020" if done else ("#14304d" if is_cur else "#1a2230")
+            cv.create_rectangle(x, by, x + s, by + s, fill=fill,
+                                outline=C_ACCENT if is_cur else "#232d3b")
+
+    def _draw_board_icon(self, cv, bx, by):
+        """在 (bx,by) 画这块标定板的样子。
+
+        棋盘画黑白方块（示意），圆点板按物面坐标逐点打点 —— 手上有几行几列、
+        是竖长条还是横条，一眼就能跟手里的板对上，避免"图案对但拿错的板"。
+        长宽比取自 OBJP，用户改了特征点数也会跟着变。
+        """
+        try:
+            o = cs.OBJP[:, :2]
+            x0, x1 = float(o[:, 0].min()), float(o[:, 0].max())
+            y0, y1 = float(o[:, 1].min()), float(o[:, 1].max())
+            span = max(x1 - x0, y1 - y0, 1e-6)
+        except Exception:
+            x0, x1, y0, y1, span = 0.0, 1.0, 0.0, 1.0, 1.0
+        LMAX = 30.0
+        bw = max(11.0, LMAX * max(x1 - x0, 1e-6) / span)
+        bh = max(11.0, LMAX * max(y1 - y0, 1e-6) / span)
+        cv.create_rectangle(bx - bw / 2, by - bh / 2, bx + bw / 2, by + bh / 2,
+                            fill="#eef3fa", outline="#8fa0b8")
+        if cc.BOARD.get("kind") == "circles":
+            r = max(1.3, min(bw, bh) * 0.10)
+            for x, y in o:
+                px = bx - bw / 2 + (x - x0) / (x1 - x0) * bw if x1 > x0 else bx
+                py = by + bh / 2 - (y - y0) / (y1 - y0) * bh if y1 > y0 else by
+                cv.create_oval(px - r, py - r, px + r, py + r,
+                               fill="#3a4a5e", outline="")
+            return
+        cwn, chn = bw / 3.0, bh / 2.0
+        for i in range(3):
+            for j in range(2):
+                if (i + j) % 2 == 0:
+                    cv.create_rectangle(bx - bw / 2 + i * cwn, by - bh / 2 + j * chn,
+                                        bx - bw / 2 + (i + 1) * cwn,
+                                        by - bh / 2 + (j + 1) * chn,
+                                        fill="#3a4a5e", outline="")
 
     def _calib_tick(self):
         w = self.calib
@@ -1637,12 +2040,17 @@ class CameraApp:
         st = w.steps[idx]
         key = (idx, len(w.cells), w.saved, w.phase,
                (w.live or {}).get("cell"))
+        # 非覆盖方案不谈覆盖格数，标个方案名免得面板上写着"覆盖 0/12"让人误会
+        if getattr(w, "plan", "cover") == "cover":
+            cov = f"覆盖 {len(w.cells)}/12"
+        else:
+            cov = PLANS.get(w.plan, "")
         if self._wiz_drawn != key:
             self._wiz_drawn = key
             self._draw_diagram(w)
             if w.step_idx >= len(w.steps) or w.phase in ("solving", "done"):
                 self.lbl_stepno.configure(text=f"完成 {len(w.steps)} / {len(w.steps)}")
-                self.lbl_cov.configure(text=f"覆盖 {len(w.cells)}/12")
+                self.lbl_cov.configure(text=cov)
                 self.lbl_step_title.configure(text="全部步骤完成")
                 self.lbl_step_do.configure(
                     text="正在求解内外参，稍等片刻，结果会弹窗给出" if w.phase != "done"
@@ -1651,7 +2059,7 @@ class CameraApp:
             else:
                 self.lbl_stepno.configure(
                     text=f"步骤 {w.step_idx + 1} / {len(w.steps)}")
-                self.lbl_cov.configure(text=f"覆盖 {len(w.cells)}/12")
+                self.lbl_cov.configure(text=cov)
                 self.lbl_step_title.configure(text=st["title"])
                 self.lbl_step_do.configure(text=self._step_do(st))
                 self.lbl_step_tip.configure(text=st["tip"])
@@ -1785,16 +2193,61 @@ class CameraApp:
                          anchor="w").grid(row=row, column=2, sticky="w", padx=(8, 0))
 
         sbox(0, "静止判定时长", "hold", "0.5", 0.3, 3, 0.1, "秒")
-        sbox(1, "棋盘内角点（横）", "cols", "9", 4, 20, 1)
-        sbox(2, "棋盘内角点（纵）", "rows", "6", 3, 20, 1)
-        sbox(3, "方格边长", "square", "25.0", 10, 100, 0.5, "mm")
 
-        tk.Label(wrap, text=f"引导共 {len(CALIB_STEPS)} 步，顺序固定：中心 → 四条边 → 四角 → 补倾斜。\n"
-                            "每步在画面和面板上标出该摆的位置；摆好、板静止后\n"
-                            "点『采集本步』（或按空格）才会保存并进入下一步。\n"
-                            "内角点数与方格边长必须与打印件一致。",
-                 font=(FT, -10), fg=C_DIM, bg=C_BG, anchor="w",
-                 justify="left").pack(fill="x", pady=(12, 0))
+        # 摆放方案：没有升降台时"全幅覆盖"根本摆不动，这里让用户直接选。
+        # 默认落在"中间横带"：只用桌面左右平移，精度实测与全幅覆盖持平。
+        tk.Label(form, text="摆放方案", font=F_MD, fg=C_SUB, bg=C_BG,
+                 anchor="w").grid(row=1, column=0, sticky="w", pady=4)
+        plan_var = tk.StringVar(value="band")
+        var["plan"] = plan_var
+        pf = tk.Frame(form, bg=C_BG)
+        pf.grid(row=1, column=1, columnspan=2, sticky="w")
+        for _p, _txt in (("band", "中间横带"), ("center", "只摆中间"),
+                         ("cover", "全幅覆盖")):
+            tk.Radiobutton(pf, text=_txt, value=_p, variable=plan_var,
+                           font=F_MD, fg=C_FG, bg=C_BG, selectcolor=C_CARD2,
+                           activebackground=C_BG, activeforeground=C_FG,
+                           highlightthickness=0, bd=0,
+                           ).pack(side="left", padx=(0, 12))
+
+        tk.Label(form, text="标定板", font=F_MD, fg=C_SUB, bg=C_BG,
+                 anchor="w").grid(row=2, column=0, sticky="w", pady=4)
+        kind_var = tk.StringVar(value="chess")
+        var["kind"] = kind_var
+        bf = tk.Frame(form, bg=C_BG)
+        bf.grid(row=2, column=1, columnspan=2, sticky="w")
+        for _k, _txt in (("chess", "棋盘格"), ("circles", "圆点板")):
+            tk.Radiobutton(bf, text=_txt, value=_k, variable=kind_var,
+                           font=F_MD, fg=C_FG, bg=C_BG, selectcolor=C_CARD2,
+                           activebackground=C_BG, activeforeground=C_FG,
+                           highlightthickness=0, bd=0,
+                           ).pack(side="left", padx=(0, 14))
+
+        sbox(3, "特征点（横）", "cols", "9", 2, 20, 1)
+        sbox(4, "特征点（纵）", "rows", "6", 2, 20, 1)
+        sbox(5, "间距 / 边长", "square", "25.0", 5, 100, 0.5, "mm")
+
+        # 两种板的默认几何：换板时把数字一并带过去，省得手填错
+        DEF = {"chess": ("9", "6", "25.0"), "circles": ("4", "5", "20.0")}
+
+        lbl_note = tk.Label(wrap, text=_note_text("chess", "band"),
+                            font=(FT, -10), fg=C_DIM, bg=C_BG, anchor="w",
+                            justify="left")
+        lbl_note.pack(fill="x", pady=(12, 0))
+
+        def refresh_note():
+            lbl_note.configure(text=_note_text(kind_var.get(), plan_var.get()))
+
+        def on_kind(*_):
+            c, r, sq = DEF[kind_var.get()]
+            var["cols"].set(c)
+            var["rows"].set(r)
+            var["square"].set(sq)
+            refresh_note()
+
+        # 放在 lbl_note 之后绑定，避免回调先于控件创建
+        kind_var.trace_add("write", on_kind)
+        plan_var.trace_add("write", lambda *_: refresh_note())
 
         hint = tk.Label(wrap, text="", font=(FT, -11), fg=C_ERR, bg=C_BG, anchor="w")
         hint.pack(fill="x", pady=(6, 0))
@@ -1806,6 +2259,8 @@ class CameraApp:
         def on_ok():
             try:
                 hold = float(var["hold"].get())
+                kind = var["kind"].get()
+                plan = var["plan"].get()
                 cols = int(float(var["cols"].get()))
                 rows = int(float(var["rows"].get()))
                 sq = float(var["square"].get())
@@ -1815,13 +2270,14 @@ class CameraApp:
             if not 0.3 <= hold <= 3.0:
                 hint.configure(text="稳定确认时长应在 0.3~3 秒")
                 return
-            if not (4 <= cols <= 20 and 3 <= rows <= 20):
-                hint.configure(text="内角点数应在 4~20 之间")
+            if not (2 <= cols <= 20 and 2 <= rows <= 20):
+                hint.configure(text="特征点数应在 2~20 之间")
                 return
-            if not 10 <= sq <= 100:
-                hint.configure(text="方格边长应在 10~100mm")
+            if not 5 <= sq <= 100:
+                hint.configure(text="间距 / 边长应在 5~100mm")
                 return
-            result.update(hold=hold, poses=len(CALIB_STEPS),
+            result.update(hold=hold, poses=len(calib_steps(kind, plan)),
+                          kind=kind, plan=plan,
                           cols=cols, rows=rows, square=sq, w=w, h=h,
                           backend=self.var_be.get())
             dlg.destroy()
@@ -1830,7 +2286,7 @@ class CameraApp:
         self._btn(bar, "取消", dlg.destroy, "ghost").pack(side="right", padx=(0, 8))
 
         dlg.update_idletasks()
-        dw, dh = 470, 440
+        dw, dh = 470, 512
         sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
         dlg.geometry(f"{dw}x{dh}+{max(0, (sw - dw) // 2)}+{max(0, (sh - dh) // 2)}")
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
@@ -1841,7 +2297,7 @@ class CameraApp:
         out = os.path.join(BASE, "calib", time.strftime("%Y%m%d_%H%M%S"))
         os.makedirs(os.path.join(out, "_failed"), exist_ok=True)
         result["out"] = out
-        result["board"] = (result["cols"], result["rows"], result["square"])
+        result["board"] = (result["kind"], result["cols"], result["rows"], result["square"])
         self.log(f"标定输出目录 {out}")
         return result
 
