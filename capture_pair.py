@@ -29,6 +29,8 @@ from ctypes import (c_void_p, c_int, c_char_p, c_uint16, c_uint64,
 import numpy as np
 import cv2
 
+from camera_lock import CameraLock
+
 # --------------------------------------------------------------- OpenNI2 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -140,6 +142,17 @@ class DepthSource(threading.Thread):
 
     def __init__(self, use_ir=False, buffer=30):
         super().__init__(daemon=True)
+        # 先抢相机锁：两个进程同时开深度流不会报错，只会悄悄大面积丢帧
+        # （2026-11-16 排查了半天的"深度空洞"就是这个）。抢不到直接报错退出。
+        self._cam_lock = CameraLock()
+        self._cam_lock.acquire()
+        try:
+            self._open(use_ir, buffer)
+        except BaseException:
+            self._cam_lock.release()
+            raise
+
+    def _open(self, use_ir=False, buffer=30):
         self.api = _load_oni()
         if self.api["init"](ONI_API_VERSION) != 0:
             raise RuntimeError("oniInitialize 失败")
@@ -279,6 +292,7 @@ class DepthSource(threading.Thread):
                 f()
         except Exception:
             pass
+        self._cam_lock.release()      # 设备已交还，锁也让出去
 
 
 def _fourcc_str(v):
