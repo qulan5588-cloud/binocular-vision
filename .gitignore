@@ -17,6 +17,12 @@ Log/
 # 运行时只需要 third_party/openni2（4.4MB）或系统安装的 OpenNI2。
 _driver/
 
+# 厂商资料与打包产物（本地留存，不入库）
+7产品规格书-Astra Pro Plus_Datasheet _v1.2.pdf
+Astra Pro Plus结构图.zip
+Astra Pro Plus结构图/
+binocular_vision_v3.zip
+
 # 编辑器 / 系统
 .vscode/
 .idea/

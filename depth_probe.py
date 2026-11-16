@@ -1,172 +1,130 @@
 # -*- coding: utf-8 -*-
+"""Astra Pro Plus 深度 / IR 流验证（OpenNI2，与 capture_gui.py 同链路）
+
+用法:
+    python depth_probe.py                 # 采 3 秒，写 _detect/<时间戳>/
+    python depth_probe.py --out D:/tmp/x
+    python depth_probe.py --ir --secs 5   # 验证标定用的 IR 流
+退出码: 0 通过 / 1 打不开设备 / 2 没收到帧
 """
-Orbbec Astra Pro Plus 深度流验证脚本（纯 ctypes，无需 GUI / 编译）
-用法: python depth_probe.py [输出目录]
-"""
-import ctypes, os, sys, time, zlib, struct
-from ctypes import c_void_p, c_uint32, c_int, c_float, c_char_p, POINTER, byref
+import argparse
+import os
+import sys
+import time
+
 import numpy as np
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-VIEWER_DIR = os.path.join(BASE, "_driver", "viewer")
-OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(BASE, "_detect")
-os.makedirs(OUT_DIR, exist_ok=True)
-os.add_dll_directory(VIEWER_DIR)
+from capture_pair import BASE_DIR, ONI_LIB_DIR, PIXFMT, DepthSource, depth_to_vis, imwrite_u
 
-lib = ctypes.CDLL(os.path.join(VIEWER_DIR, "OrbbecSDK.dll"))
-PP = POINTER(c_void_p)
+# 像素格式 -> 每个原始单位代表多少毫米
+MM_PER_UNIT = {100: 1.0, 101: 0.1, 102: 1.0}
 
-def sig(name, restype, argtypes):
-    f = getattr(lib, name)
-    f.restype = restype
-    f.argtypes = argtypes
-    return f
 
-ob_create_context            = sig("ob_create_context", c_void_p, [PP])
-ob_create_context_with_config= sig("ob_create_context_with_config", c_void_p, [c_char_p, PP])
-ob_query_device_list         = sig("ob_query_device_list", c_void_p, [c_void_p, PP])
-ob_device_list_device_count  = sig("ob_device_list_device_count", c_uint32, [c_void_p, PP])
-ob_device_list_get_serial    = sig("ob_device_list_get_device_serial_number", c_char_p, [c_void_p, c_uint32, PP])
-ob_create_pipeline           = sig("ob_create_pipeline", c_void_p, [PP])
-ob_pipeline_start            = sig("ob_pipeline_start", None, [c_void_p, PP])
-ob_pipeline_wait_for_frameset= sig("ob_pipeline_wait_for_frameset", c_void_p, [c_void_p, c_uint32, PP])
-ob_frameset_depth_frame      = sig("ob_frameset_depth_frame", c_void_p, [c_void_p, PP])
-ob_frameset_color_frame      = sig("ob_frameset_color_frame", c_void_p, [c_void_p, PP])
-ob_video_frame_width         = sig("ob_video_frame_width", c_uint32, [c_void_p, PP])
-ob_video_frame_height        = sig("ob_video_frame_height", c_uint32, [c_void_p, PP])
-ob_frame_data                = sig("ob_frame_data", c_void_p, [c_void_p, PP])
-ob_frame_data_size           = sig("ob_frame_data_size", c_uint32, [c_void_p, PP])
-ob_frame_format              = sig("ob_frame_format", c_int, [c_void_p, PP])
-ob_depth_frame_value_scale   = sig("ob_depth_frame_get_value_scale", c_float, [c_void_p, PP])
-ob_frame_index               = sig("ob_frame_index", ctypes.c_uint64, [c_void_p, PP])
-ob_delete_frame              = sig("ob_delete_frame", None, [c_void_p, PP])
-ob_pipeline_stop             = sig("ob_pipeline_stop", None, [c_void_p, PP])
-ob_error_message             = sig("ob_error_message", c_char_p, [c_void_p])
+def stretch_u8(arr):
+    """按 2%~98% 分位线性拉伸到 0~255；0 值（无效区）保持全黑"""
+    v = arr[arr > 0]
+    if v.size == 0:
+        return np.zeros(arr.shape, np.uint8)
+    lo, hi = np.percentile(v, 2), np.percentile(v, 98)
+    span = hi - lo if hi > lo else 1.0
+    g = (np.clip((arr.astype(np.float32) - lo) / span, 0, 1) * 255).astype(np.uint8)
+    g[arr == 0] = 0
+    return g
 
-def err_text(e):
-    if not e:
-        return ""
-    e = e.contents.value if hasattr(e, "contents") else e
-    return ob_error_message(e) or ""
 
-def write_png(path, rgb):
-    h, w, _ = rgb.shape
-    raw = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
-    def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-    png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-    png += chunk(b"IDAT", zlib.compress(raw, 6))
-    png += chunk(b"IEND", b"")
-    open(path, "wb").write(png)
+def main():
+    ap = argparse.ArgumentParser(description="Astra Pro Plus 深度/IR 流验证（OpenNI2）")
+    ap.add_argument("--out", default="", help="输出目录，默认 _detect/<时间戳>/")
+    ap.add_argument("--ir", action="store_true", help="验证 IR 流（标定那路）")
+    ap.add_argument("--secs", type=float, default=3.0, help="采集时长(秒)")
+    args = ap.parse_args()
 
-print("=" * 60)
-print("Orbbec Astra Pro Plus 深度流验证")
-print("=" * 60)
+    out = os.path.abspath(args.out or os.path.join(BASE_DIR, "_detect", time.strftime("%Y%m%d_%H%M%S")))
+    os.makedirs(out, exist_ok=True)
+    tag = "ir" if args.ir else "depth"
+    label = "IR" if args.ir else "深度"
 
-e = c_void_p()
-CFG = os.path.join(VIEWER_DIR, "OrbbecSDKConfig_v1.0.xml")
-ctx = ob_create_context_with_config(CFG.encode(), byref(e))
-if not ctx:
-    print("创建 context 失败:", err_text(e)); sys.exit(1)
+    print("=" * 60)
+    print(f" Astra Pro Plus {label}流验证（OpenNI2）")
+    print("=" * 60)
+    print(f" 运行时 : {ONI_LIB_DIR}")
+    print(f" 输出   : {out}")
 
-print("[1] 枚举设备 ...")
-devs = ob_query_device_list(ctx, byref(e))
-if not devs:
-    print("查询设备列表失败:", err_text(e)); sys.exit(1)
-n = ob_device_list_device_count(devs, byref(e))
-print("    发现设备数量:", n)
-if n == 0:
-    print("    !! 没有任何 Orbbec 设备被枚举到"); sys.exit(1)
-for i in range(n):
-    sn = ob_device_list_get_serial(devs, i, byref(e))
-    print(f"    设备[{i}] 序列号: {sn.decode() if sn else '(空)'}")
+    print("\n[1/4] 打开设备 ...")
+    try:
+        src = DepthSource(use_ir=args.ir)
+    except RuntimeError as e:
+        print(f"  !! {e}")
+        print("  排查：插好相机（设备管理器应有 ORBBEC Depth Sensor）")
+        print("       驱动装完必须重启电脑")
+        print("       换 USB 口，中间不要接外接 HUB")
+        print("       powershell -File check_usb.ps1 看链路")
+        return 1
 
-print("[2] 创建 pipeline 并启动默认流 ...")
-pipe = ob_create_pipeline(byref(e))
-if not pipe:
-    print("创建 pipeline 失败:", err_text(e)); sys.exit(1)
-t0 = time.time()
-ob_pipeline_start(pipe, byref(e))
-if e:
-    print("    启动失败:", err_text(e)); sys.exit(1)
-print(f"    启动成功，耗时 {time.time()-t0:.2f}s")
+    w, h, fps, fmt = src.mode
+    print(f"  {src.name}  {src.vid:04X}:{src.pid:04X}  {w}x{h}@{fps}fps  {PIXFMT.get(fmt, fmt)}")
 
-print("[3] 接收帧 ...")
-got = 0
-depth_arr = None
-info = {}
-fps_t0 = None
-NF = 30
-for k in range(NF):
-    fs = ob_pipeline_wait_for_frameset(pipe, 2000, byref(e))
-    if not fs:
-        print("    第", k, "次等待帧超时:", err_text(e))
-        continue
-    if fps_t0 is None:
-        fps_t0 = time.time()
-    df = ob_frameset_depth_frame(fs, byref(e))
-    if not df:
-        print("    该帧集里没有深度帧:", err_text(e))
-        continue
-    if k == 0:
-        w = ob_video_frame_width(df, byref(e))
-        h = ob_video_frame_height(df, byref(e))
-        fmt = ob_frame_format(df, byref(e))
-        scale = ob_depth_frame_value_scale(df, byref(e))
-        sz = ob_frame_data_size(df, byref(e))
-        ptr = ob_frame_data(df, byref(e))
-        info = dict(w=w, h=h, fmt=fmt, scale=scale, size=sz)
-        buf = ctypes.string_at(ptr, sz)
-        arr = np.frombuffer(buf, dtype=np.uint16).reshape(h, w).copy()
-        depth_arr = arr
-        print(f"    深度帧: {w}x{h}  format={fmt}(8=Y16)  size={sz}B  value_scale={scale}")
-    if k == NF - 1:
-        cf = ob_frameset_color_frame(fs, byref(e))
-        if cf:
-            cw = ob_video_frame_width(cf, byref(e))
-            ch = ob_video_frame_height(cf, byref(e))
-            csz = ob_frame_data_size(cf, byref(e))
-            print(f"    彩色帧: {cw}x{ch}  size={csz}B  format={ob_frame_format(cf, byref(e))}")
-    ob_delete_frame(fs, byref(e))
-    got += 1
+    print(f"\n[2/4] 采集 {args.secs:g} 秒 ...")
+    try:
+        src.start()
+    except RuntimeError as e:
+        print(f"  !! {e}")
+        src.release()
+        return 2
 
-dt = time.time() - fps_t0 if fps_t0 else 0
-print(f"    收到 {got}/{NF} 个帧集，用时 {dt:.2f}s -> {got/dt if dt else 0:.1f} fps")
+    t0, base = time.time(), src.count
+    while time.time() - t0 < args.secs:
+        time.sleep(0.05)
+    dt, got = time.time() - t0, src.count - base
+    frame = src.latest()
+    src.close()
+    src.release()
 
-if depth_arr is None:
-    print("[!] 未取到深度帧，退出"); sys.exit(2)
+    if frame is None:
+        print("  !! 一帧都没收到")
+        return 2
 
-print("[4] 深度数据分析 ...")
-valid = depth_arr[depth_arr > 0]
-scale = info["scale"] or 1.0
-print(f"    分辨率      : {info['w']}x{info['h']}")
-print(f"    有效像素    : {valid.size} / {depth_arr.size}  ({valid.size/depth_arr.size*100:.1f}%)")
-if valid.size:
-    print(f"    原始值范围  : {depth_arr.min()} ~ {depth_arr.max()}")
-    mm = depth_arr.astype(np.float64) * scale
-    vv = valid.astype(np.float64) * scale
-    print(f"    物理距离    : {vv.min():.0f} mm ~ {vv.max():.0f} mm  (中位 {np.median(vv):.0f} mm)")
-    print(f"    中心 20x20  : {np.median(mm[info['h']//2-10:info['h']//2+10, info['w']//2-10:info['w']//2+10]):.0f} mm")
+    arr = frame[0]
+    measured = got / dt if dt else 0.0
+    print(f"  {got} 帧 / {dt:.2f} 秒 => {measured:.1f} fps")
+    if measured < fps * 0.8:
+        print(f"  !! 低于标称 {fps}fps 的 80%：查暗光降帧 / HUB 层数 / 线材")
 
-# 灰度映射保存（0=黑）
-norm = np.zeros_like(depth_arr, dtype=np.float64)
-if valid.size:
-    mm_all = depth_arr.astype(np.float64) * scale
-    lo, hi = np.percentile(vv, 2), np.percentile(vv, 98)
-    if hi <= lo:
-        hi = lo + 1
-    norm = np.clip((mm_all - lo) / (hi - lo), 0, 1)
-    norm[depth_arr == 0] = 0
-gray = (norm * 255).astype(np.uint8)
-rgb = np.stack([gray, gray, gray], axis=-1)
-p1 = os.path.join(OUT_DIR, "depth_raw.png")
-write_png(p1, rgb)
-print(f"    深度图已保存: {p1}")
+    print("\n[3/4] 数据 ...")
+    valid = arr[arr > 0]
+    print(f"  {arr.shape[1]}x{arr.shape[0]} {arr.dtype}  "
+          f"有效 {valid.size}/{arr.size} ({valid.size / arr.size * 100:.1f}%)")
+    if valid.size == 0:
+        print("  !! 整帧全 0，没有有效数据")
+        np.save(os.path.join(out, f"{tag}_raw.npy"), arr)
+        return 0
+    print(f"  原始值 {arr.min()} ~ {arr.max()}")
+    if args.ir:
+        print(f"  强度中位 {np.median(valid):.0f}（IR 是反射强度，不换算毫米）")
+    else:
+        k = MM_PER_UNIT.get(fmt, 1.0)
+        mm = valid.astype(np.float64) * k
+        cy, cx = arr.shape[0] // 2, arr.shape[1] // 2
+        c = arr[max(0, cy - 10):cy + 10, max(0, cx - 10):cx + 10]
+        c = c[c > 0]
+        print(f"  距离 {mm.min():.0f} ~ {mm.max():.0f} mm  中位 {np.median(mm):.0f} mm")
+        if c.size:
+            print(f"  中心20x20 中位 {np.median(c) * k:.0f} mm")
 
-np.save(os.path.join(OUT_DIR, "depth_raw.npy"), depth_arr)
-print(f"    原始数据已保存: {os.path.join(OUT_DIR, 'depth_raw.npy')}")
+    print("\n[4/4] 写盘 ...")
+    files = [os.path.join(out, f"{tag}_raw.png")]
+    imwrite_u(files[0], stretch_u8(arr))
+    if not args.ir:
+        files.append(os.path.join(out, f"{tag}_vis.png"))
+        imwrite_u(files[-1], depth_to_vis(arr))
+    files.append(os.path.join(out, f"{tag}_raw.npy"))
+    np.save(files[-1], arr)
+    for f in files:
+        print(f"  {f}")
 
-ob_pipeline_stop(pipe, byref(e))
-print("[5] 完成，深度流验证通过 ✅")
+    print(f"\n 完成，{label}流验证通过")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

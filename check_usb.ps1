@@ -3,6 +3,9 @@ param(
     [int]$IntervalMs = 800
 )
 
+# Get-PnpDeviceProperty 默认会刷进度条，把报告糊满
+$ProgressPreference = 'SilentlyContinue'
+
 function Get-Chain {
     param([string]$InstanceId)
     $chain = [System.Collections.ArrayList]@()
@@ -102,8 +105,13 @@ function Show-Report {
     $r.ChainLines | ForEach-Object { Write-Host $_ }
     if ($r.Verdict -eq 'OK') {
         Write-Host '  => GOOD: only the in-camera hub, ready to capture' -ForegroundColor Green
+    } elseif ($r.HubCount -eq 2) {
+        Write-Host ('  => WARN: 1 extra hub in path -> {0}' -f $r.ExtraHub) -ForegroundColor Yellow
+        Write-Host '     One active extension cable is fine (dual stream 30/30, 10s no drop).' -ForegroundColor Yellow
+        Write-Host '     Do not stack another hub on top of it.' -ForegroundColor Yellow
     } else {
-        Write-Host ('  => BAD: extra hub in path -> {0}' -f $r.ExtraHub) -ForegroundColor Red
+        Write-Host ('  => BAD: {0} extra hubs in path -> {1}' -f ($r.HubCount - 1), $r.ExtraHub) -ForegroundColor Red
+        Write-Host '     Too many layers. Remove one before calibrating.' -ForegroundColor Red
     }
 }
 
@@ -112,7 +120,7 @@ if ($Watch) {
     $lastKey = ''
     while ($true) {
         $r = Get-Report
-        $key = '{0}|{1}|{2}|{3}' -f $r.Online, $r.Depth, $r.Color, $r.Verdict
+        $key = '{0}|{1}|{2}|{3}|{4}' -f $r.Online, $r.Depth, $r.Color, $r.Verdict, $r.HubCount
         if ($key -ne $lastKey) {
             Show-Report -r $r
             $lastKey = $key
