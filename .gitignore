@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 采集与标定数据（体积大，只留在本地）
+captures*/
+calib/
+_detect/
+Log/
+*.npy
+*.bag
+
+# 相机 SDK / 驱动的原始压缩包与安装器（约 779MB）。
+# 运行时只需要 third_party/openni2（4.4MB）或系统安装的 OpenNI2。
+_driver/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.workbuddy/
+*.log
+desktop.ini
+Thumbs.db
