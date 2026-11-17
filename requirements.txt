@@ -3,3 +3,20 @@
 numpy==2.5.4
 opencv-python==5.0.0.93
 pillow==13.0.0
+
+# 识别/追踪（本地模型，见 models/；models/ 下的 onnx/task 文件随仓库走）
+mediapipe==1.2.3                # 手势交互 app_gesture（HandLandmarker）
+onnxruntime-directml==1.24.4    # YOLO 语义分割 app_objects（DirectML 吃 4060，免 CUDA/cuDNN）
+# 注意：若再装 ultralytics（导出模型用）或 faster-whisper（语音控制用），它们
+# 会带 CPU 版 onnxruntime 顶掉 directml 的文件（共用模块目录），装完必须
+# 重装：pip install --force-reinstall --no-deps onnxruntime-directml==1.24.4
+faster-whisper==1.2.1           # 语音控制 voice_cmd（base int8 纯 CPU）
+pyttsx3                         # 仅自测 _detect/voice_e2e 用（系统 TTS 合成音源）
+
+# ---------------------------------------------------------------------------
+# 可选：Open3D TSDF 融合（app_scan.py --tsdf，见 README §4.11）
+# 不在上面自动装，因为要 2.6GB 且只对 N 卡有用。需要时手动执行：
+#   pip install https://github.com/isl-org/Open3D/releases/download/v0.20.0/open3d_cuda-0.20.0-cp312-cp312-win_amd64.whl
+#   pip install nvidia-cublas-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-npp-cu12
+# 注意 wheel 名是 open3d_cuda-*（官网文档写的 open3d-* 是 CPU 版，装了 cuda=False）。
+# ---------------------------------------------------------------------------

@@ -34,3 +34,8 @@ binocular_vision_v3.zip
 desktop.ini
 Thumbs.db
 binocular_vision_v3.zip
+_weights/
+
+# whisper 语音模型（base 145MB / small 461MB，太大不入库；换机用
+# HF_ENDPOINT=https://hf-mirror.com 重新下载，见 README §4.12）
+models/whisper/
