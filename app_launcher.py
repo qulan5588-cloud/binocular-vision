@@ -19,7 +19,7 @@
 只在状态变化时重绘，一次约 15ms。
 
 用法：python app_launcher.py
-操作：点卡片 或 数字键 1-6 启动；r 刷新；q / ESC / 点 X 退出
+操作：点卡片 或 数字键 1-9/0 启动；r 刷新；q / ESC / 点 X 退出
 """
 import os
 import subprocess
@@ -34,7 +34,7 @@ import camera_lock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "_detect")
-W, H = 1120, 1000         # 9 张卡片 2 列 5 行
+W, H = 1120, 1000         # 10 张卡片 2 列 5 行
 
 BG = (20, 22, 26)
 CARD = (32, 35, 42)
@@ -58,21 +58,24 @@ APPS = [
     dict(key="4", name="安全距离", script="app_guard.py", color=(110, 170, 255),
          desc="视场分三区报最近距离，近了标红闪边，AGV 前方净空",
          cmd="python app_guard.py"),
-    dict(key="5", name="物体计数", script="app_objects.py", color=(230, 160, 255),
-         desc="按深度跳变分割物体，剔掉桌面墙面，数个数并粗估尺寸",
+    dict(key="5", name="物体分割计数", script="app_objects.py", color=(230, 160, 255),
+         desc="YOLO 认类别+实例掩码（GPU），深度量尺寸；y 键切几何分割",
          cmd="python app_objects.py"),
     dict(key="6", name="深度监视", script="app_depthview.py", color=(255, 210, 110),
          desc="实时看深度：有效率、8x6 网格缺口、直方图、稳定度累积",
          cmd="python app_depthview.py"),
     dict(key="7", name="人数统计", script="app_people.py", color=(120, 235, 150),
-         desc="人脸追踪带编号和距离，跨线计数进出人数",
+         desc="人脸追踪带编号和距离，YOLO 人体兜底；跨线计数进出人数",
          cmd="python app_people.py"),
     dict(key="8", name="手势交互", script="app_gesture.py", color=(90, 220, 255),
          desc="食指当光标、捏合当点击，悬停自动触发按钮",
          cmd="python app_gesture.py"),
     dict(key="9", name="室内扫描", script="app_scan.py", color=(255, 150, 130),
-         desc="端着相机慢慢走一圈，拼出彩色点云 + 俯视平面图，可导出 PLY",
+         desc="端着相机慢慢走一圈，拼出彩色点云 + 俯视平面图，可导出 PLY（加 --tsdf 还能出网格）",
          cmd="python app_scan.py"),
+    dict(key="0", name="语音控制", script="voice_cmd.py", color=(170, 160, 255),
+         desc="说中文控制扫描：暂停/保存/重扫/全高度…本地 whisper 不联网",
+         cmd="python voice_cmd.py"),
 ]
 
 
@@ -307,7 +310,7 @@ def main():
                 state["pending"] = h
 
     cv2.setMouseCallback(win, on_mouse)
-    print("工具箱已启动：点卡片或按 1-6 启动应用，q 退出", flush=True)
+    print("工具箱已启动：点卡片或按 1-9/0 启动应用，q 退出", flush=True)
 
     while True:
         # 1) 执行待启动请求（一帧只做一次，避免连点开出一串实例）
@@ -340,6 +343,8 @@ def main():
             state["focus"] = -1
         if ord("1") <= k <= ord("9"):
             state["pending"] = k - ord("1")
+        elif k == ord("0"):
+            state["pending"] = 9
 
         # 4) 点窗口 X 也要能退出：cv2 的 X 不会结束 waitKey 循环
         try:
