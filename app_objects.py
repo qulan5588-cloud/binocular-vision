@@ -30,7 +30,14 @@
 
 操作：
     鼠标点右上角 MIRROR = 镜像画面（文字不镜像）
+    y = 语义分割(YOLO) / 几何分割 切换 —— YOLO 能认出类别（bottle/suitcase/
+        person/...），贴着的两个东西也能分开；几何模式靠深度跳变，不认识
+        物体但对任意形状都工作
     p = 平面剔除开关    d = 深度伪彩叠加    s = 存图    q / ESC = 退出
+
+YOLO 模式说明：模型 models/yolo11n_seg.onnx（COCO 80 类）在彩色图上出实例
+掩码，掩码内的深度点（经标定投影）用 0.5%/99.5% 分位量长宽高 —— 识别归
+RGB、量尺寸归深度，互不掺假。DirectML 推理约 8ms，4060 上整链 15ms。
 """
 import argparse
 import os
@@ -44,6 +51,12 @@ from ui_common import wait_key
 from app_align import adapt_cal, latest_calib, load_calib
 from app_guard import btn_rect, draw_button
 from app_pointcloud import Z_LO, Z_HI, project_to_image
+
+try:
+    from yolo_seg import YoloSeg, draw_dets, MODEL_PATH as YOLO_PATH
+except Exception:                                  # onnxruntime 装不上也不碍事
+    YoloSeg = None
+    YOLO_PATH = ""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "captures")
@@ -209,6 +222,62 @@ def analyze(depth_mm, cal, dsz, csz, args, plane_on=True):
                 uc=uc, vc=vc, ratio=float(ok.mean()))
 
 
+# ---------------------------------------------------- YOLO 模式的深度统计 ---
+def yolo_stats(det, P, ok, plane, uc, vc, uid, band=0.10):
+    """把一个 YOLO 实例映射到深度点云上量尺寸。
+
+    掩码在彩色图坐标系；深度点经标定投影落在哪个彩色像素，就查那个像素
+    的掩码 —— 得到 (深度网格形状) 的布尔图，再取其中的点云统计。
+    排除已剔的背景平面，挡住掩码边缘"透过物体看到的后墙"。
+
+    再做一层**深度主簇**过滤：RGB 掩码边缘的遮挡泄漏会让物体身后的背景
+    深度点混进掩码区（实机首测：椅子量出 4.2m 进深，其实是整间屋）。
+    按 z 做 10cm 直方图，取最密峰所在的连续带（计数 > 峰值 20% 才续上），
+    只对带内点量尺寸 —— 物体自身是实心连续的，背景是零散泄漏。
+    """
+    ch, cw = uc.shape
+    # 无效投影：NaN/inf（深度 0）以及除以近零深度产生的 1e32 级巨值 ——
+    # 后者是"有限但溢出 int32"的 cast，必须先钳到画布范围
+    uc = np.clip(np.where(np.isfinite(uc), uc, 0.0), 0.0, cw - 1)
+    vc = np.clip(np.where(np.isfinite(vc), vc, 0.0), 0.0, ch - 1)
+    vc_i = vc.astype(np.int32)
+    uc_i = uc.astype(np.int32)
+    m = det["mask"][vc_i, uc_i] & ok & ~plane
+    n = int(m.sum())
+    if n < 30:
+        return None
+    subP = P[m]
+    z = subP[:, 2]
+
+    # 深度主簇
+    zlo = float(np.percentile(z, 1)) - band
+    hist, edges = np.histogram(z, bins=np.arange(zlo, zlo + np.ptp(z) + 2 * band, band))
+    if hist.max() < 15:
+        return None
+    peak = int(hist.argmax())
+    lo_i = hi_i = peak
+    while lo_i > 0 and hist[lo_i - 1] > 0.2 * hist[peak]:
+        lo_i -= 1
+    while hi_i < len(hist) - 1 and hist[hi_i + 1] > 0.2 * hist[peak]:
+        hi_i += 1
+    sel = (z >= edges[lo_i]) & (z < edges[hi_i + 1])
+    subP = subP[sel]
+    if len(subP) < 60:
+        return None
+
+    lo, hi = np.percentile(subP, 0.5, axis=0), np.percentile(subP, 99.5, axis=0)
+    span = (hi - lo) / 0.99
+    cen = 0.5 * (lo + hi)
+    order = np.argsort(subP[:, 2])
+    near = subP[order[:max(1, int(0.3 * len(subP)))], 2]
+    x0, y0, w, h = det["box"]
+    return dict(id=uid, n=len(subP), z=float(np.median(near)),
+                w=float(span[0]), h=float(span[1]), d=float(span[2]),
+                cx=float(cen[0]), cy=float(cen[1]), cz=float(cen[2]),
+                u=float(x0 + w / 2), v=float(y0 + h / 2),
+                name=det["name"], conf=det["conf"], mask=det["mask"])
+
+
 # --------------------------------------------------------------- 绘制 ---
 BOX_EDGES = ((0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7),
              (0, 4), (1, 5), (2, 6), (3, 7))
@@ -219,38 +288,73 @@ def draw(canvas, res, args, plane_on, csz, cal):
     mir = args.mirror
     flip_u = (lambda a: (cw - 1 - a)) if mir else (lambda a: a)
 
-    if plane_on and res["plane"].any():
-        pm = res["plane"]
-        canvas[res["vc"][pm].astype(int), flip_u(res["uc"][pm]).astype(int)] = C_PLANE
+    if res.get("yolo") is not None:
+        # YOLO 模式：掩码叠加 + 类别框 + 3D 包围盒
+        dets, stats = res["yolo_dets"], res["yolo"]
+        vis = []
+        for d in dets:
+            dd = dict(d)
+            if mir:                       # 画面翻了，掩码和框跟着翻
+                dd["mask"] = d["mask"][:, ::-1]
+                x0, y0, w, h = d["box"]
+                dd["box"] = (cw - 1 - (x0 + w - 1), y0, w, h)
+            vis.append(dd)
+        names = {i: s["name"] for i, s in enumerate(stats)}
+        draw_dets(canvas, vis, names)
+        for s in stats:
+            col = (90, 235, 150)
+            corners = np.array([[s["cx"] + sx * s["w"] / 2,
+                                 s["cy"] + sy * s["h"] / 2,
+                                 s["cz"] + sz * s["d"] / 2]
+                                for sx in (-1, 1) for sy in (-1, 1)
+                                for sz in (-1, 1)], np.float32)
+            cu, cv2_, cok = project_to_image(corners, cal["K_c"], cal["D_c"],
+                                             cw, ch)
+            if cok.all():
+                p2 = np.stack([flip_u(cu), cv2_], axis=1).astype(np.int32)
+                for a, b in BOX_EDGES:
+                    cv2.line(canvas, tuple(p2[a]), tuple(p2[b]), col, 1,
+                             cv2.LINE_AA)
+        n = len(stats)
+        head = f"{n} object{'s' if n != 1 else ''}  (yolo seg)"
+    else:
+        if plane_on and res["plane"].any():
+            pm = res["plane"]
+            canvas[res["vc"][pm].astype(int),
+                   flip_u(res["uc"][pm]).astype(int)] = C_PLANE
 
-    for o in res["objs"]:
-        col = PALETTE[(o["id"] - 1) % len(PALETTE)]
-        x0, y0, w, h = o["bbox"]
-        sub = res["labels"][y0:y0 + h, x0:x0 + w] == o["lab"]
-        uu = res["uc"][y0:y0 + h, x0:x0 + w][sub]
-        vv = res["vc"][y0:y0 + h, x0:x0 + w][sub]
-        canvas[vv.astype(int), flip_u(uu).astype(int)] = col
+        for o in res["objs"]:
+            col = PALETTE[(o["id"] - 1) % len(PALETTE)]
+            x0, y0, w, h = o["bbox"]
+            sub = res["labels"][y0:y0 + h, x0:x0 + w] == o["lab"]
+            uu = res["uc"][y0:y0 + h, x0:x0 + w][sub]
+            vv = res["vc"][y0:y0 + h, x0:x0 + w][sub]
+            canvas[vv.astype(int), flip_u(uu).astype(int)] = col
 
-        # 3D 包围盒 8 角投回彩色图连线
-        corners = np.array([[o["cx"] + sx * o["w"] / 2, o["cy"] + sy * o["h"] / 2,
-                             o["cz"] + sz * o["d"] / 2]
-                            for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)],
-                           np.float32)
-        cu, cv2_, cok = project_to_image(corners, cal["K_c"], cal["D_c"], cw, ch)
-        if cok.all():
-            p2 = np.stack([flip_u(cu), cv2_], axis=1).astype(np.int32)
-            for a, b in BOX_EDGES:
-                cv2.line(canvas, tuple(p2[a]), tuple(p2[b]), col, 1, cv2.LINE_AA)
+            # 3D 包围盒 8 角投回彩色图连线
+            corners = np.array([[o["cx"] + sx * o["w"] / 2,
+                                 o["cy"] + sy * o["h"] / 2,
+                                 o["cz"] + sz * o["d"] / 2]
+                                for sx in (-1, 1) for sy in (-1, 1)
+                                for sz in (-1, 1)], np.float32)
+            cu, cv2_, cok = project_to_image(corners, cal["K_c"], cal["D_c"],
+                                             cw, ch)
+            if cok.all():
+                p2 = np.stack([flip_u(cu), cv2_], axis=1).astype(np.int32)
+                for a, b in BOX_EDGES:
+                    cv2.line(canvas, tuple(p2[a]), tuple(p2[b]), col, 1,
+                             cv2.LINE_AA)
 
-        txt = f"#{o['id']} {o['z'] * 10:.0f}dm {o['w'] * 100:.0f}x{o['h'] * 100:.0f}cm"
-        tx, ty = int(flip_u(o["u"])), int(o["v"])
-        cv2.putText(canvas, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(canvas, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    col, 1, cv2.LINE_AA)
+            txt = (f"#{o['id']} {o['z'] * 10:.0f}dm "
+                   f"{o['w'] * 100:.0f}x{o['h'] * 100:.0f}cm")
+            tx, ty = int(flip_u(o["u"])), int(o["v"])
+            cv2.putText(canvas, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(canvas, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        col, 1, cv2.LINE_AA)
 
-    n = len(res["objs"])
-    head = f"{n} object{'s' if n != 1 else ''}"
+        n = len(res["objs"])
+        head = f"{n} object{'s' if n != 1 else ''}"
     cv2.putText(canvas, head, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
                 (0, 0, 0), 5, cv2.LINE_AA)
     cv2.putText(canvas, head, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
@@ -273,6 +377,8 @@ def main():
     ap.add_argument("--zmin", type=float, default=0.40, help="只关心此距离之外(m)")
     ap.add_argument("--zmax", type=float, default=6.00, help="只关心此距离之内(m)")
     ap.add_argument("--top", type=int, default=12, help="最多标注几块")
+    ap.add_argument("--conf", type=float, default=0.35, help="YOLO 置信度阈值")
+    ap.add_argument("--no-yolo", action="store_true", help="禁用语义分割（只用几何分割）")
     ap.add_argument("--keep-plane", action="store_true", help="不剔平面")
     ap.add_argument("--shot", default="", help="出一张图后退出")
     ap.add_argument("--mirror", action="store_true", help="启动即镜像画面")
@@ -290,9 +396,20 @@ def main():
 
     cal, dsz, csz = adapt_cal(cal, depth.mode, color.mode)
     ch, cw = csz
-    win = "Objects  [p=plane  d=depth  f=mirror  s=save  q=quit]"
+    win = "Objects  [y=yolo/geom  p=plane  d=depth  f=mirror  s=save  q=quit]"
     plane_on = not args.keep_plane
     show_depth = False
+
+    yolo = None
+    yolo_mode = False
+    if YoloSeg is not None and not args.no_yolo and os.path.exists(YOLO_PATH):
+        yolo = YoloSeg()
+        yolo_mode = True
+        print(f"YOLO 语义分割就绪（{yolo.provider}，COCO 80 类），"
+              f"y 键可切回几何分割")
+    elif not args.no_yolo:
+        print("提示：未找到 models/yolo11n_seg.onnx 或 onnxruntime，"
+              "只有几何分割模式（pip 装 onnxruntime-directml 可启用 YOLO）")
 
     def on_mouse(ev, x, y, _f, _p):
         if ev == cv2.EVENT_LBUTTONDOWN:
@@ -317,6 +434,19 @@ def main():
             img = cp.ColorSourceFFmpeg.decode(cz[0]) if getattr(color, "is_jpeg", False) else cz[0]
             res = analyze(cv2.flip(dz[0], 1), cal, dsz, csz, args, plane_on)
 
+            if yolo_mode and yolo is not None:
+                dets = yolo.detect(img, conf=args.conf, max_det=args.top)
+                stats = []
+                for d in dets:
+                    s = yolo_stats(d, res["P"], res["ok"], res["plane"],
+                                   res["uc"], res["vc"], len(stats) + 1)
+                    if s:
+                        stats.append(s)
+                res["yolo"] = stats
+                res["yolo_dets"] = dets[:len(stats)]
+            else:
+                res["yolo"] = None
+
             canvas = cv2.flip(img, 1) if args.mirror else img.copy()
             if show_depth:
                 g = np.clip((res["P"][..., 2] - 0.3) / 5.7, 0, 1)
@@ -335,7 +465,8 @@ def main():
                 now = time.time()
                 fps = 0.8 * fps + 0.2 * (5.0 / max(now - t_prev, 1e-6))
                 t_prev = now
-            head = (f"{fps:4.1f} fps | jump {args.jump:.0f}mm | min {args.min_area}px | "
+            head = (f"{fps:4.1f} fps | {'yolo ' + yolo.provider.split('Execution')[0] if (yolo_mode and yolo) else 'geom'} | "
+                    f"jump {args.jump:.0f}mm | min {args.min_area}px | "
                     f"{'plane-removed' if plane_on else 'raw'} | valid {res['ratio'] * 100:.0f}%")
             cv2.putText(canvas, head, (12, ch - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 0, 0), 4, cv2.LINE_AA)
@@ -344,11 +475,21 @@ def main():
 
             if args.shot:
                 cp.imwrite_u(args.shot, canvas)
-                for o in res["objs"]:
-                    print(f"  #{o['id']}  {o['n']:6d}pt  z={o['z']:.3f}m  "
-                          f"{o['w'] * 1000:.0f}x{o['h'] * 1000:.0f}x{o['d'] * 1000:.0f}mm  "
-                          f"vol≈{o['w'] * o['h'] * o['d'] * 1000:.1f}L")
-                print(f"共 {len(res['objs'])} 块 | 存 {args.shot}")
+                for s in res.get("yolo") or res["objs"]:
+                    if "name" in s:
+                        print(f"  {s['name']:<12s} conf={s['conf']:.2f}  "
+                              f"z={s['z']:.3f}m  "
+                              f"{s['w'] * 1000:.0f}x{s['h'] * 1000:.0f}x"
+                              f"{s['d'] * 1000:.0f}mm  "
+                              f"vol≈{s['w'] * s['h'] * s['d'] * 1000:.1f}L")
+                    else:
+                        print(f"  #{s['id']}  {s['n']:6d}pt  z={s['z']:.3f}m  "
+                              f"{s['w'] * 1000:.0f}x{s['h'] * 1000:.0f}x"
+                              f"{s['d'] * 1000:.0f}mm  "
+                              f"vol≈{s['w'] * s['h'] * s['d'] * 1000:.1f}L")
+                mode = "YOLO 语义分割" if res.get("yolo") is not None else "几何分割"
+                print(f"共 {len(res.get('yolo') or res['objs'])} 块（{mode}）| "
+                      f"存 {args.shot}")
                 break
 
             cv2.imshow(win, canvas)
@@ -359,6 +500,12 @@ def main():
                 fn = os.path.join(OUT_DIR, time.strftime("objects_%H%M%S.png"))
                 cp.imwrite_u(fn, canvas)
                 print("saved captures/" + os.path.basename(fn))
+            elif k == ord("y"):
+                if yolo is not None:
+                    yolo_mode = not yolo_mode
+                    print("分割模式：", "YOLO 语义分割" if yolo_mode else "几何（深度跳变）")
+                else:
+                    print("YOLO 不可用（缺模型或 onnxruntime）")
             elif k == ord("p"):
                 plane_on = not plane_on
                 print("平面剔除", "开" if plane_on else "关")
