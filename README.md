@@ -47,6 +47,31 @@ python capture_gui.py
 启动日志第一行会打印版本号，例如 `界面版本：2026-11-15 手动采集版 v3`。
 看不到这行说明跑的是旧进程/旧文件。
 
+### 1.5 一键启动（`start.bat`）
+
+不想记 python 路径 / 依赖装哪个解释器 / 语音要不要单独开窗口，**双击 `start.bat`**：
+
+```
+  双目视觉 · 启动台      内存 5.1/15.7 GB 可用
+  1. 室内扫描（实时平面图 + 切片）
+  2. 室内扫描 + TSDF 三维重建（导出 mesh.ply）
+  3. 语音控制（自动挑麦，控制 Indoor Scan 窗口）
+  4. 扫描 + 语音一起开（语音另开窗口）
+  5. 功能启动台（全部卡片）
+  6. 麦克风自检（录 4 秒看电平 + 试识别）
+  7. 列出输入设备 + 现场电平
+  0. 退出
+```
+
+也可以带参数直接进（适合做桌面快捷方式）：`start.bat scan|tsdf|voice|both|toolbox|check|list`。
+
+启动前会做两件事：
+
+* **内存体检**：可用内存 < 3 GB 时提醒先关 VS Code —— 16 GB 机器上 IDE + 浏览器
+  能吃掉 6 GB，扫描时余量不足会丢帧、把双目同步打散（实测关掉 VS Code 从
+  1.6 GB 回到 5.2 GB，帧率 30.0/29.6 fps、同步差均值 12.6 ms）。
+* **确认解释器**：不在 `.venv` 里跑会提示，避免缺 opencv/onnxruntime。
+
 ## 2. 文件说明
 
 | 文件 | 作用 |
@@ -60,6 +85,12 @@ python capture_gui.py
 | `check_usb.ps1` | USB 链路自检（识别 HUB 层数、抓多余的设备节点） |
 | `depth_probe.py` | 深度/IR 流验证：枚举、帧率、有效像素、深度统计，结果存 `_detect/<时间戳>/` |
 | `probe_*.py` / `set_exposure.py` | 排查用的小工具：帧率、取流、曝光、设备枚举 |
+| `yolo_seg.py` | YOLO11-seg ONNX 推理包装（DirectML/CPU），app_objects / app_people 共用 |
+| `voice_cmd.py` | 本地语音控制（whisper 转写 → 关键词 → 给应用窗口发键），见 §4.12 |
+| `plan_from_ply.py` | 离线重渲扫描平面图（读 cloud.ply，不碰相机） |
+| `tsdf_fuse.py` | 可选 TSDF 融合后端（Open3D VoxelBlockGrid，`app_scan.py --tsdf` 用） |
+| `start.bat` / `_launch.py` | 一键启动菜单（见 §1.5）：内存体检 + 常用组合，双击即用 |
+| `_detect/voice_monitor.py` | 语音链路旁听器：同一套门限/切句，只打印不发键，用来查"说了没反应" |
 
 ## 3. 采集要点（踩过的坑）
 
@@ -254,7 +285,28 @@ python app_objects.py --shot out.png   # 出一张图后退出
 ```
 
 操作：点右上角 MIRROR（或 f）= 镜像画面，p = 平面剔除开关，d = 深度伪彩，
-s = 存图，q = 退出。
+**y = 语义分割（YOLO）/ 几何分割 切换**，s = 存图，q = 退出。
+
+**YOLO 语义分割模式**（默认开启，需 `models/yolo11n_seg.onnx` + `onnxruntime-directml`）：
+
+* 模型 YOLO11n-seg（COCO 80 类，静态 640 输入，11MB）在彩色图上出实例掩码，
+  认得出的类别直接标名字（bottle / suitcase / chair / person / backpack……）；
+* 掩码内深度点（经标定投影查掩码）用 0.5%/99.5% 分位量长宽高 —— **识别归
+  RGB、量尺寸归深度**，尺寸仍是真实测量不是猜的；
+* 掩码内做**深度主簇**过滤（10cm 直方图最密峰 + 峰值 20% 连续生长）：
+  RGB 掩码边缘的遮挡泄漏会让物体身后的墙混进来，不滤的话椅子量出 4.2m
+  进深（实机首测）；
+* 推理走 DirectML（RTX 4060 实测纯推理 8.2ms、整链 14.5ms，CPU 是 42.6ms）。
+  为什么不是 onnxruntime-gpu：Windows 上要自装 CUDA+cuDNN，DirectML 一个
+  pip 包直接吃任意 DX12 GPU。**注意 ultralytics 会带一个 CPU 版
+  onnxruntime 把 directml 文件顶掉**（两个包共用模块目录），装完要重装
+  onnxruntime-directml；
+* 已知限制：透明/吸光容器（矿泉水瓶）深度是洞，量到的是身后背景的簇；
+  3m 外的低置信检出尺寸不可信。这些按 `y` 切回几何分割即可。
+
+YOLO 模型重导出（换类/换尺寸才需要）：`pip install ultralytics` 后
+`YOLO('yolo11n-seg.pt').export(format='onnx', imgsz=640, opset=17,
+dynamic=False)`。运行时不依赖 torch。
 
 关键实现：
 * 分割在**深度图 2D 域**做（相邻像素深度差 > jump 即断开 + 膨胀 1px 成分隔带，
@@ -267,8 +319,11 @@ s = 存图，q = 退出。
 * 自测：`_detect/objects_selftest.py`，真实内参光线求交渲染"背板+两箱子"，
   分块 2/2、尺寸相对误差 3.0% / 7.9%。
 
-已知限制：贴在一起且深度连续的物体会算成一块；正对光轴的物体侧面是掠射角
-（1px 宽），量不出深度方向尺寸——包围盒深向会偏小。
+已知限制（几何模式）：贴在一起且深度连续的物体会算成一块；正对光轴的物体
+侧面是掠射角（1px 宽），量不出深度方向尺寸——包围盒深向会偏小。（这两条
+正是 YOLO 模式要解决的：实例分割不靠深度连续性分物体。）
+自测：`_detect/yolo_selftest.py`——letterbox 往返、掩码->深度->分位尺寸链路
+（合成刚体误差 <3.3%）、背景剔除、GPU provider、性能五组断言。
 
 ### 4.7 工具箱入口（`app_launcher.py`）
 
@@ -335,10 +390,17 @@ python app_people.py --image a.png  # 单张图检测出图（不占相机）
 * **交叉防串**：匹配按"中心距预测位置 / 人脸尺度"贪心——两人迎面走过画面上
   重合的那几帧，只看距离必然配反，轨迹互相拖拽卡在线两侧不穿越；加匀速预测
   （速度指数平滑）后自测 9/9 通过；
-* 操作：m 镜像，l 显隐计数线，[ / ] 调阈值，s 存图，q / 窗口 X 退出。
+* **人体兜底（P2）**：背面/低头/暗光下 YuNet 看不到脸，复用 YOLO 分割模型
+  （`models/yolo11n_seg.onnx`，GPU 约 15ms/次，隔帧跑）的 person 类兜底。
+  两段式匹配防重复计数：人脸优先配轨迹 → 没配上的脸开新轨迹 → 人体框再配
+  （刚开的脸轨迹也在候选里，同一人的身体框被脸轨迹"吃掉"）→ 剩下的才开
+  人体轨迹。人体框锚点取框顶往下 1/4（头的位置），和人脸中心语义一致；
+  人体轨迹确认门槛 4 帧（人脸 3 帧）——证据弱（外套/海报可能误检），宁可
+  晚计不误计。`--no-yolo` 关闭，`y` 键运行中切换；
+* 操作：m 镜像，l 显隐计数线，[ / ] 调阈值，y 人体兜底开关，s 存图，q / 窗口 X 退出。
 
-自测：`_detect/people_selftest.py`（9 例合成轨迹：单程/往返/线上抖/交叉/丢失续
-接/注销/误检/并排）。
+自测：`_detect/people_selftest.py`（13 例合成轨迹：单程/往返/线上抖/交叉/丢失续
+接/注销/误检/并排 + 人体兜底接管/纯人体跨线/脸回来不重复/双人混合）。
 
 ### 4.10 手势交互（`app_gesture.py`）
 
@@ -383,6 +445,7 @@ KinectFusion 精简版，不需要 scipy/open3d。
 ```bash
 python app_scan.py                    # 交互扫描，左边平面图右边实况
 python app_scan.py --voxel 0.03      # 体素更粗（点少一半、更快）
+python app_scan.py --tsdf            # 额外跑 Open3D TSDF，导出 mesh.ply（可选）
 python app_scan.py --sec 20 --out captures/scan_demo   # 定时自测并保存
 ```
 
@@ -408,7 +471,8 @@ python app_scan.py --sec 20 --out captures/scan_demo   # 定时自测并保存
   + 剔除稀疏边缘碎格 + 3 点 RANSAC 播种（法线约束在竖直 45° 内，
   防天花碎格拉歪初始平面）+ PCA 精修，43ms/次。平面图投影到地板平面
   上、"高度"= 地板上方高度、切片沿地板法线切 —— 世界系歪了也能出
-  正的房间图。默认切片地板+0.10±0.20m；`[ ]` 上下移（10cm），
+  正的房间图。默认切片地板+0.10±0.20m；`x` 一键切全高度/切片（看家具
+  实物用全高度），`[ ]` 上下移（10cm），
   `-` / `=` 调带宽（5cm）；保存同时出切片版 plan.png + 全高度
   plan_full.png；`r` 重扫会重新拟合地板；
 * **保存**（s 键 / 定时）：`captures/scan_*` 下 cloud.ply（顶点色，
@@ -423,3 +487,108 @@ python app_scan.py --sec 20 --out captures/scan_demo   # 定时自测并保存
   终点漂移分别 4.4/3.0/6.9mm（路程 1.95m / 1.65m / 转 69°）；
 * **已知局限**：没有 IMU，平面图默认相机基本端平；没有回环检测，绕一圈
   回起点有累积漂移（走远了分段扫再拼）；反光/吸光面在点云里是洞。
+
+#### 可选后端：Open3D TSDF（`--tsdf`，实测数据说话）
+
+默认的 2cm 体素去重零依赖、可回溯，短板是**只有散点、没有网格**，噪声也不
+做平均（薄门板扫两遍会糊成两层）。加 `--tsdf` 会额外把同一批深度帧喂给
+Open3D 的 `VoxelBlockGrid`（TSDF 加权融合），保存时多出两个文件：
+
+| 文件 | 内容 |
+|---|---|
+| `cloud_tsdf.ply` | 等值面点云（tsdf=0），比原始点云更薄更准 |
+| `mesh.ply` | 三角网格（带顶点色，8.6MB/房间量级），可量面积体积 |
+
+**2026-11-17 实测**（`_detect/tsdf_bench.py`，合成 6x8x2.6m 房间 + 两件家具，
+20 帧 / 2cm 体素，RTX 4060 8G）：
+
+| 方案 | 每帧耗时 | 点数 | 三角面 | 墙面厚度 | 地面平整度 |
+|---|---|---|---|---|---|
+| 现方案 numpy 体素 | 14.4ms | 160.9k | — | 23.0mm | 19.0mm |
+| Open3D TSDF · CUDA | **1.2ms** | 125.9k | 246.5k | **15.7mm** | **14.0mm** |
+| Open3D TSDF · CPU | 5.1ms | 125.9k | 246.5k | 15.7mm | 14.0mm |
+
+（耗时只算 integrate；彩色融合再加 5.6ms/帧，因为要把彩色 remap 到深度图、
+按 uint16+uint8 上传。ICP 那 11ms/帧 是两种方案都要付的。）
+
+结论：**TSDF 确实更好，但只作为可选增强**——装完实测占 **2.6GB**（open3d
+333MB + cublas 737MB / cusolver 450MB / cusparse 456MB / npp 385MB /
+nvrtc 179MB，其中 cublasLt、npp 的绝大多数库根本用不到），而且换台没 N 卡的
+机器就退化成 CPU 版。所以默认关，主流程保持零依赖。
+
+装法（Windows，Python 3.12）：
+
+```bash
+# 1) 官方 release 里的 CUDA preview wheel（官网文档的 URL 是错的，
+#    真正的文件名是 open3d_cuda-...，不是 open3d-...）
+pip install https://github.com/isl-org/Open3D/releases/download/v0.20.0/open3d_cuda-0.20.0-cp312-cp312-win_amd64.whl
+# 2) 它静态依赖的 CUDA 运行库（pip 不会自动加到 PATH，tsdf_fuse.py 里用
+#    os.add_dll_directory 自己挂）
+pip install nvidia-cublas-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-npp-cu12
+```
+
+* 版本号对不上（open3d 期望 12.6、pip 装到 12.9）只是 warning，同一大版本
+  二进制兼容，实测可用；
+* 退出时会打印一行 `CUDA runtime error: driver shutting down`——open3d 的
+  静态析构与解释器退出顺序冲突，**无害**，数据已保存完；
+* 自测：`_detect/tsdf_selftest.py`（6 项：可用性 / 彩色集成 / 点云非空 /
+  颜色 / 墙厚 / mesh 写盘回读），当前 6/6 通过。
+
+### 4.12 本地语音控制（`voice_cmd.py`）
+
+第十个应用：说中文控制应用——独立进程监听麦克风 → faster-whisper 转写 →
+关键词精确匹配 → 给目标窗口 `PostMessage WM_CHAR` 发键（复用已实测的远程
+按键链路，目标窗口不用聚焦）。
+
+为什么独立进程而不是塞进各 app 主循环：转写一句 0.7~3s，塞进去会把 19fps
+的扫描卡成幻灯片；各 app 本来就有键盘接口，语音只是"替你按键"。
+
+```bash
+python voice_cmd.py                     # 默认控制 Indoor Scan（自动挑麦克风）
+python voice_cmd.py --check             # ★ 说了没反应先跑这个：录 4 秒看电平
+python voice_cmd.py --list              # 列输入设备 + 现场电平（挑设备）
+python voice_cmd.py --device 2          # 指定麦克风（--list 里的编号）
+python voice_cmd.py --target People     # 控制指定窗口（标题子串）
+python voice_cmd.py --wav a.wav         # 用录音跑完整链路（不占麦克风）
+python voice_cmd.py --text "帮我保存"    # 离线测关键词映射（不开麦）
+python voice_cmd.py --model small       # 一级就上 small（更准，慢 3 倍）
+python voice_cmd.py --no-fallback       # 关掉 small 复核
+```
+
+* **指令表**：开始/继续/暂停 → 空格，保存 → s，重扫/清空 → r，
+  三维/预览 → v，网格 → g，全高度 → x，上一层 → `]`，下一层 → `[`，
+  加宽 → `=`，变窄 → `-`，退出 → q；`t` 键切换目标窗口，`q` 退出；
+* **两级识别**：一级 base int8（约 1s）；一级没匹配上（或命中多个不同
+  指令）时用 small int8（约 3s）复核一遍，仍不确定就不发键。实测同一句
+  很轻的输入（峰值 0.03），base 听成「暴存」、small 能听对「保存」；
+* **宁可不执行，不能乱执行**：能量门限触发录音（自适应噪声底）、短于
+  0.4s 丢弃、`no_speech_prob>0.55` 判幻觉丢弃、"同词重复 ≥3 次或碎片
+  >8 个"判幻觉丢弃、一句里命中**多个不同指令**时交给 small 裁决、发键后
+  1.5s 冷却防重复；
+* **取最先说的那个词**（不是词表优先级）：实测弱信号下 base 会输出
+  「保存 第1层 下一层 下一层…」，按词表顺序会命中"下一层"发出 `[`——
+  用户明明说的是"保存"；
+* **音频踩过的三个坑**（2026-11-17 排查"语音控制没反应"）：
+  1. 系统默认输入可能指向**相机自带的远场麦克风**（本机默认 #1 Astra，
+     峰值 3e-5，等于没有）；`--check` / `--list` 能看出来，`--device N` 换；
+  2. **必须按设备原生采样率开流**：某些设备用 16kHz 开流不报错，但读回来
+     全是 0（静音而非异常），比报错难查得多；重采样到 16k 交给 whisper；
+  3. 提示词别写成整句（"以下是室内扫描软件的简短中文指令："）——输入一
+     弱，whisper 会把**提示句本身**当内容吐出来；改成纯词表后不再复现；
+* **自动增益**：送 whisper 前把峰值抬到 0.2 量级（最多 +18dB），弱麦克风
+  也能识别；输入实在太轻（峰值 <0.0015）直接跳过，不喂给模型；
+* **模型**：`models/whisper/base`（145MB）+ `models/whisper/small`（461MB），
+  都不入库。换机重建：`HF_ENDPOINT=https://hf-mirror.com`，
+  `snapshot_download("Systran/faster-whisper-base", local_dir="models/whisper/base")`；
+* **依赖坑**：faster-whisper 会带 CPU 版 onnxruntime 顶掉 directml
+  （同 ultralytics 的坑），装完必须
+  `pip install --force-reinstall --no-deps onnxruntime-directml==1.24.4`；
+* **自测**：
+  * `_detect/voice_selftest.py`（27 例：同义说法 / 负例 / 多词取最先 /
+    歧义检测）；
+  * `_detect/voice_e2e.py`（系统 TTS 中文指令 → 真实转写 → 映射）；
+  * `_detect/key_selftest.py`（PostMessage WM_CHAR 发键链路：开一个 cv2
+    窗口自收自发，5/5 收到，含空格）；
+  * `--wav` 四级音量回归（0dB/-20dB/-30dB/-36dB）：四级都正确发出 `s`，
+    最弱两档由 small 复核兜住。
+
