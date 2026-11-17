@@ -605,6 +605,15 @@ def main():
                     help="额外用 Open3D TSDF 融合（要装 open3d，导出 mesh.ply）")
     args = ap.parse_args()
 
+    # 开流前锁短曝光：暗光下 UVC 自动曝光会把曝光拉长到 >1/30s，
+    # 彩色随之掉到 20fps 左右。锁 -6（1/64s）可稳定跑满 30fps。
+    # 必须在相机未被占用时设置，且设置在相机上保持，故放在开流之前。
+    try:
+        ok, ev = cp.set_camera_exposure(exp=-6, device_index=0, auto=False)
+        print(f"彩色曝光：{'已锁定' if ok else '锁定失败'} EV={ev}（防暗光降帧）", flush=True)
+    except Exception as _e:
+        print(f"彩色曝光设置跳过：{_e}", flush=True)
+
     depth = cp.DepthSource()
     depth.start()
     color = cp.ColorSourceFFmpeg(1280, 720, 30, device=cp.FFMPEG_DEVICE)

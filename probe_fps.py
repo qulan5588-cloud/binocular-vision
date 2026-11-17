@@ -37,6 +37,13 @@ def main():
     depth = None
     color = None
     try:
+        # 开流前锁短曝光：暗光下 UVC 自动曝光会把彩色拖到 ~20fps，
+        # 探测的是"软件真实可达帧率"，必须先排除这个干扰。
+        try:
+            cp.set_camera_exposure(exp=-6, device_index=0, auto=False)
+        except Exception:
+            pass
+
         if not args.color_only:
             print("[1/3] 深度流 ...")
             depth = cp.DepthSource(use_ir=False)
@@ -47,17 +54,26 @@ def main():
             print("[1/3] 跳过深度流")
 
         print("[2/3] 彩色流 ...")
-        idx = args.camera
-        if idx < 0:
-            idx = cp.find_orbbec_camera()
-            if idx is None:
-                print("      !! 没有可用的彩色相机")
-                return 1
-        color = cp.ColorSource(idx, args.width, args.height, args.fps)
-        cw, ch, cf = color.mode
-        print(f"      index={idx}  实际协商 {cw}x{ch}@{cf}  FOURCC={color.fourcc}")
-        if color.fourcc != "MJPG":
-            print("      !! FOURCC 不是 MJPG，帧率必然很低")
+        # 用 ffmpeg 裸流后端（app_scan.py 实际使用的后端，可跑满 30fps）。
+        # 不用 OpenCV/dshow —— OpenCV 5.0 的 MJPG 解码只有约 7fps，
+        # 会让探测结果假性不达标。
+        if cp.find_ffmpeg():
+            color = cp.ColorSourceFFmpeg(args.width, args.height, args.fps,
+                                         device=cp.FFMPEG_DEVICE)
+            cw, ch, cf = color.mode
+            print(f"      ffmpeg裸流  设备 '{color.device}'  协商 {cw}x{ch}@{cf}  FOURCC=MJPG")
+        else:
+            idx = args.camera
+            if idx < 0:
+                idx = cp.find_orbbec_camera()
+                if idx is None:
+                    print("      !! 没有可用的彩色相机")
+                    return 1
+            color = cp.ColorSource(idx, args.width, args.height, args.fps)
+            cw, ch, cf = color.mode
+            print(f"      dshow  index={idx}  实际协商 {cw}x{ch}@{cf}  FOURCC={color.fourcc}")
+            if color.fourcc != "MJPG":
+                print("      !! FOURCC 不是 MJPG，帧率必然很低")
         color.start()
 
         print(f"[3/3] 预热 1.5s 后采样 {args.secs:.0f}s ...")
