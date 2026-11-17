@@ -22,10 +22,11 @@
 用法：
     python app_scan.py                  # 交互扫描，边扫边看平面图
     python app_scan.py --voxel 0.03     # 体素更粗（点更少、更快）
+    python app_scan.py --tsdf           # 额外用 Open3D TSDF 融合，导出 mesh.ply
     python app_scan.py --sec 20 --out captures/scan_demo   # 定时自测并保存
 
 按键：空格 暂停/继续，s 保存（ply+平面图+轨迹），r 清空重扫，
-      v 开关 3D 预览，g 开关米格，[ ] 平面图高度切片上下移，
+      v 开关 3D 预览，g 开关米格，x 切片/全高度切换，[ ] 切片上下移，
       - / = 调切片带宽，q / 窗口 X 退出。
 """
 import argparse
@@ -549,11 +550,22 @@ def draw_stats(img, lines, x0, y0, dy=22):
 
 
 # ============================================================ 保存 ===
-def save_all(m: Map, out_base, meta, band=None, floor=None):
+def save_all(m: Map, out_base, meta, band=None, floor=None, tsdf=None):
     os.makedirs(out_base, exist_ok=True)
     P, C = m.cloud()
     if len(P):
         save_ply(os.path.join(out_base, "cloud.ply"), P, C)
+    if tsdf is not None and tsdf.frames:
+        # 可选后端：等值面点云 + 三角网格（可量面积/体积）
+        try:
+            Pt, Ct = tsdf.cloud()
+            if len(Pt):
+                save_ply(os.path.join(out_base, "cloud_tsdf.ply"), Pt, Ct)
+            tsdf.save_mesh(os.path.join(out_base, "mesh.ply"))
+            meta = dict(meta, tsdf=f"{tsdf.device} voxel {tsdf.voxel * 100:.0f}cm",
+                        tsdf_frames=tsdf.frames, tsdf_points=int(len(Pt)))
+        except Exception as e:                            # noqa: BLE001
+            print(f"TSDF 导出失败：{e}", flush=True)
     snap = make_snapshot(m, dict(ppm=None), floor)
     plan = np.zeros((1080, 1080, 3), np.uint8)
     render_plan(plan, snap, m.traj, np.eye(4), True, band=band, floor=floor)
@@ -589,6 +601,8 @@ def main():
     ap.add_argument("--no-window", action="store_true", help="不开窗口（管道自测用）")
     ap.add_argument("--no-autosave", action="store_true",
                     help="退出时不自动保存（默认退出就存，省得忘了按 s）")
+    ap.add_argument("--tsdf", action="store_true",
+                    help="额外用 Open3D TSDF 融合（要装 open3d，导出 mesh.ply）")
     args = ap.parse_args()
 
     depth = cp.DepthSource()
@@ -603,6 +617,15 @@ def main():
           f"fx={Kd[0, 0]:.1f} cx={Kd[0, 2]:.1f}", flush=True)
 
     m = Map(args.voxel)
+    tsdf = None
+    if args.tsdf:
+        # 可选后端：装不上就退回默认体素融合，不让一个增强功能把主流程搞挂
+        try:
+            import tsdf_fuse
+            tsdf = tsdf_fuse.TsdfFuse(voxel=args.voxel)
+            print(f"TSDF 后端已启用：{tsdf.device}", flush=True)
+        except Exception as e:                        # noqa: BLE001
+            print(f"--tsdf 不可用（{e}），继续用默认体素融合", flush=True)
     G = np.eye(4)
     prev = None
     T_pred = np.eye(4)
@@ -623,6 +646,7 @@ def main():
     snap = dict(P=np.zeros((0, 3), np.float32), box=(0, 1, 0, 1),
                 ylo=0.0, yhi=1.0, ppm=None, cx=0.0, cz=0.0)
     band = [0.10, 0.20]     # [切片中心, 半带宽]：地板坐标系里的"地板上方高度"
+    show_band = True        # False 时平面图画全高度（看家具/实物全貌用）
     fl = None               # 地板平面 (c,e1,e2,n,d0)；点攒够后周期性重估
     npts = 0
     out_path = args.out or os.path.join(CAP, time.strftime("scan_%Y%m%d_%H%M%S"))
@@ -698,6 +722,16 @@ def main():
                 if keep.any():
                     Pw = V[keep] @ G[:3, :3].T + G[:3, 3]
                     m.add(Pw.astype(np.float32), rgb[keep], G[:3, 3])
+                    if tsdf is not None:
+                        # TSDF 要吃"对齐到深度图"的彩色图：用同一份 proj 重采样
+                        cbgr = None
+                        img0 = grab_color(cz) if proj is not None else None
+                        if img0 is not None:
+                            cbgr = cv2.remap(img0, proj[0].astype(np.float32),
+                                             proj[1].astype(np.float32),
+                                             cv2.INTER_LINEAR,
+                                             borderMode=cv2.BORDER_CONSTANT)
+                        tsdf.integrate(d.astype(np.float32) * 0.001, Kd, G, cbgr)
                     G_fused = G.copy()
 
             if frame_i % SNAP_EVERY == 1:
@@ -717,7 +751,8 @@ def main():
             # ------------------ 画面 ------------------
             canvas = np.zeros((720, 1280, 3), np.uint8)
             render_plan(canvas[:, :956], snap, m.traj, G, show_grid,
-                        band=tuple(band) if fl is not None else None, floor=fl)
+                        band=tuple(band) if (fl is not None and show_band) else None,
+                        floor=fl)
 
             live = grab_color(cz)
             live = (cv2.resize(live, (320, 180), interpolation=cv2.INTER_AREA)
@@ -755,7 +790,8 @@ def main():
             ]
             draw_stats(canvas, lines, 966, y0)
             for i, s in enumerate(["space pause", "s save", "r reset", "v 3d",
-                                   "g grid", "q quit", "[ ] slice", "- = width"]):
+                                   "g grid", "q quit", "x full", "[ ] slice",
+                                   "- = width"]):
                 cv2.putText(canvas, s, (966 + (i % 2) * 130, 700 - (i // 2) * 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.36, (140, 146, 158), 1,
                             cv2.LINE_AA)
@@ -776,6 +812,12 @@ def main():
                 preview = None
             elif k == ord("r"):
                 m.reset()
+                if tsdf is not None:      # TSDF 也得清，否则重扫的点和旧房间叠一起
+                    try:
+                        tsdf = tsdf_fuse.TsdfFuse(voxel=args.voxel)
+                    except Exception as e:                # noqa: BLE001
+                        print(f"TSDF 重置失败（{e}），本趟只用默认后端", flush=True)
+                        tsdf = None
                 G = np.eye(4)
                 prev = None
                 T_pred = np.eye(4)
@@ -784,6 +826,8 @@ def main():
                 snap["ppm"] = None
                 fl = None                 # 重扫后地板平面要重新拟合
                 print("地图已清空", flush=True)
+            elif k == ord("x"):
+                show_band = not show_band
             elif k == ord("["):
                 band[0] -= 0.10
             elif k == ord("]"):
@@ -795,12 +839,12 @@ def main():
             elif k == ord("s"):
                 save_all(m, out_path, dict(frames=frame_i, voxel=args.voxel,
                                            fx=float(Kd[0, 0]), cx=float(Kd[0, 2])),
-                         tuple(band) if fl is not None else None, fl)
+                         tuple(band) if fl is not None else None, fl, tsdf)
                 print("saved", out_path, flush=True)
             if args.sec and time.time() - t0 > args.sec:
                 save_all(m, out_path, dict(frames=frame_i, voxel=args.voxel,
                                            fx=float(Kd[0, 0]), cx=float(Kd[0, 2])),
-                         tuple(band) if fl is not None else None, fl)
+                         tuple(band) if fl is not None else None, fl, tsdf)
                 print(f"{args.sec:.0f}s 到点，已保存 {out_path}  点数 {npts}", flush=True)
                 break
     finally:
@@ -812,7 +856,7 @@ def main():
                 save_all(m, out_path, dict(frames=frame_i, voxel=args.voxel,
                                            fx=float(Kd[0, 0]), cx=float(Kd[0, 2]),
                                            auto=True),
-                         tuple(band) if fl is not None else None, fl)
+                         tuple(band) if fl is not None else None, fl, tsdf)
                 print(f"退出自动保存 {out_path}  （{m.fused} 帧融合）", flush=True)
             except Exception as e:                            # noqa: BLE001
                 print(f"自动保存失败：{e}（数据丢失，下次请按 s）", flush=True)
