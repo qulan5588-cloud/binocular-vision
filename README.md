@@ -49,7 +49,26 @@ python capture_gui.py
 
 ### 1.5 一键启动（`start.bat`）
 
-不想记 python 路径 / 依赖装哪个解释器 / 语音要不要单独开窗口，**双击 `start.bat`**：
+不想记 python 路径 / 依赖装哪个解释器 / 语音要不要单独开窗口，**双击 `start.bat`**
+直接进主界面（`app_launcher.py`，十张功能卡片，点卡片或按 `1-9/0` 启动，`q` 退出）：
+
+```
+  工具箱已启动：点卡片或按 1-9/0 启动应用，q 退出
+```
+
+要精确启动某个东西就带参数（适合做桌面快捷方式）：
+
+| 命令 | 作用 |
+|---|---|
+| `start.bat` | 主界面（十张卡片） |
+| `start.bat menu` | 文字菜单（下面那张表） |
+| `start.bat scan` | 室内扫描 |
+| `start.bat tsdf` | 扫描 + TSDF 三维重建（导出 `mesh.ply`） |
+| `start.bat voice` | 语音控制（自动挑麦，控制 `Indoor Scan` 窗口） |
+| `start.bat both` | 扫描 + 语音一起开（语音另开窗口） |
+| `start.bat check` / `list` | 麦克风自检 / 输入设备列表 |
+
+`start.bat menu` 那张表长这样：
 
 ```
   双目视觉 · 启动台      内存 5.1/15.7 GB 可用
@@ -63,13 +82,12 @@ python capture_gui.py
   0. 退出
 ```
 
-也可以带参数直接进（适合做桌面快捷方式）：`start.bat scan|tsdf|voice|both|toolbox|check|list`。
-
 启动前会做两件事：
 
 * **内存体检**：可用内存 < 3 GB 时提醒先关 VS Code —— 16 GB 机器上 IDE + 浏览器
   能吃掉 6 GB，扫描时余量不足会丢帧、把双目同步打散（实测关掉 VS Code 从
-  1.6 GB 回到 5.2 GB，帧率 30.0/29.6 fps、同步差均值 12.6 ms）。
+  1.6 GB 回到 5.2 GB，帧率 30.0/29.6 fps、同步差均值 12.6 ms）。进主界面
+  只提醒不拦，开扫描/TSDF 才会停下来等你回车。
 * **确认解释器**：不在 `.venv` 里跑会提示，避免缺 opencv/onnxruntime。
 
 ## 2. 文件说明

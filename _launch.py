@@ -1,19 +1,21 @@
 """_launch.py —— 统一启动入口（双击 start.bat，或 python _launch.py [命令]）
 
-为什么要有这个：直接跑 app_scan.py 得先记着"用 .venv 里的 python"、"语音要单独
-开窗口"、"相机麦要手动 --device 2"，一到换机器/换人就踩坑。这里把常用组合做成
-菜单，并且**启动前先看一眼内存**——16GB 机器上 VS Code 全开能吃掉 4GB，扫描会
-丢帧，提前提醒比事后查靠谱。
+默认行为：**直接进主界面**（`app_launcher.py`，十张功能卡片），跟双击一个
+exe 的体验一致——多数时候人就是想看看有哪些功能，不该先答一道菜单题。
 
-命令（也可以给 start.bat 传参，方便做桌面快捷方式）：
-    python _launch.py             # 交互菜单
+要精确启动某个东西时给参数（也可以给 start.bat 传，方便做桌面快捷方式）：
+    python _launch.py             # 主界面（app_launcher.py）
+    python _launch.py menu        # 旧的交互菜单（扫描/语音/自检…）
     python _launch.py scan        # 室内扫描
     python _launch.py tsdf        # 扫描 + TSDF 三维重建
     python _launch.py voice       # 语音控制
-    python _launch.py both        # 扫描 + 语音（两个窗口）
-    python _launch.py toolbox     # 功能启动台
+    python _launch.py both        # 扫描 + 语音（语音另开窗口）
     python _launch.py check       # 麦克风自检
     python _launch.py list        # 输入设备列表
+
+为什么还要包这一层：直接跑脚本得先记着"用 .venv 里的 python"、"语音要单独
+开窗口"、"相机麦要手动 --device 2"，换机器/换人就踩坑；这里统一收口，并且
+**启动前看一眼内存**——16GB 机器上 VS Code 全开能吃掉 4GB，扫描会丢帧。
 """
 import ctypes
 import os
@@ -49,8 +51,12 @@ def mem_gb():
     return m.ullTotalPhys / 2 ** 30, m.ullAvailPhys / 2 ** 30
 
 
-def check_env():
-    """启动前体检：内存余量 + 是不是在 .venv 里跑"""
+def check_env(interactive=True):
+    """启动前体检：内存余量 + 是不是在 .venv 里跑
+
+    interactive=False 时不等人回车——进主界面用不着拦一道，提醒一句就够；
+    真正要开扫描/TSDF 时才值得让人确认一下。
+    """
     total, avail = mem_gb()
     venv_py = os.path.join(HERE, ".venv", "Scripts", "python.exe")
     if os.path.exists(venv_py) and os.path.normcase(PY) != os.path.normcase(venv_py):
@@ -59,11 +65,12 @@ def check_env():
     if total and avail < MEM_WARN_GB:
         print(f"⚠ 可用内存只剩 {avail:.1f} GB / 共 {total:.1f} GB")
         print("  扫描时容易丢帧、双目同步变差；建议先关掉 VS Code/浏览器再扫")
-        print("  （继续也没关系，按回车开始）")
-        try:
-            input()
-        except (EOFError, KeyboardInterrupt):
-            pass
+        if interactive:
+            print("  （继续也没关系，按回车开始）")
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                pass
 
 
 def run(script, args=(), new_console=False):
@@ -126,13 +133,18 @@ def menu():
 
 def main():
     arg = sys.argv[1].strip().lower() if len(sys.argv) > 1 else ""
-    if not arg:
+    # 无参数 = 直接进主界面（十张卡片），不再让人先答一道菜单题
+    if arg in ("", "main", "home", "ui", "gui", "toolbox", "launcher"):
+        check_env(interactive=False)
+        return run("app_launcher.py")
+    if arg == "menu":
         return menu()
     key = ALIAS.get(arg, arg)
     if key not in ACTIONS:
         print(__doc__)
         return 2
-    check_env()
+    # 开相机/跑 GPU 的那几项才值得拦一下确认内存
+    check_env(interactive=key in ("1", "2", "4"))
     return ACTIONS[key][1]()
 
 
