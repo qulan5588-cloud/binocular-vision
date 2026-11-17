@@ -27,6 +27,9 @@
 窗口内按键：t 切换目标窗口，q 退出。
 
 指令表（中文，说一句发一键）：
+    【启动应用】对齐测距 / 尺寸测量 / 安全距离 / 物体分割 / 深度监视 /
+        人数统计 / 手势交互 / 三维点云 / 室内扫描 → 直接打开对应程序
+    【发键给目标窗口】
     开始 / 继续 / 暂停 / 停一下 → 空格（暂停开关）
     保存 → s            重扫 / 清空 → r
     三维 / 预览 → v      网格 → g          全高度 → x
@@ -45,6 +48,7 @@ import argparse
 import ctypes
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -96,6 +100,52 @@ KEYWORDS = [
 ]
 
 TARGETS = ["Indoor Scan", "Objects", "People", "Gesture", "Depth", "Toolbox"]
+
+# 说应用名 → 直接启动对应程序（工具箱里的九张卡片）。
+# 与 KEYWORDS 不同：这里启动的是新进程，不是给目标窗口发键。
+# 顺序：先长后短，"测量"类要放在"测距"之后避免歧义。
+APP_LAUNCH = [
+    (["对齐测距", "测距", "对齐", "深度对齐", "align"], "app_align.py", "对齐测距"),
+    (["尺寸测量", "测尺寸", "量尺寸", "量一下尺寸", "平面测量"],
+     "app_measure.py", "尺寸测量"),
+    (["安全距离", "安全分区", "警戒", "guard"], "app_guard.py", "安全距离"),
+    (["物体分割", "物体识别", "分割计数", "物体计数"], "app_objects.py", "物体分割计数"),
+    (["深度监视", "看深度", "深度视图", "depth view"], "app_depthview.py", "深度监视"),
+    (["人数统计", "数人数", "人脸统计", "people"], "app_people.py", "人数统计"),
+    (["手势交互", "手势控制", "手势"], "app_gesture.py", "手势交互"),
+    (["三维点云", "点云", "point cloud"], "app_pointcloud.py", "3D 点云"),
+    (["室内扫描", "开始建模", "扫描建模"], "app_scan.py", "室内扫描"),
+]
+
+
+def match_app(text):
+    """转写文本 → (脚本名, 说明)，命中应用启动词。取最早出现的那条。"""
+    t = (text or "").replace(" ", "").replace("，", "").replace("。", "")
+    best, pos_best = None, len(t) + 1
+    for kws, script, name in APP_LAUNCH:
+        for k in kws:
+            kk = k.replace(" ", "")
+            i = t.find(kk)
+            if 0 <= i < pos_best:
+                pos_best = i
+                best = (script, name)
+    return best or ("", "")
+
+
+def launch_app(script, name=""):
+    """用当前解释器（.venv 的 python）启动一个应用，返回是否成功。"""
+    path = os.path.join(HERE, script)
+    if not os.path.isfile(path):
+        print(f"  找不到应用脚本 {path}", flush=True)
+        return False
+    try:
+        subprocess.Popen([sys.executable, path], cwd=HERE,
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
+        print(f"  已启动 {name or script}（{script}）", flush=True)
+        return True
+    except Exception as e:                                   # noqa: BLE001
+        print(f"  启动失败：{e}", flush=True)
+        return False
 
 
 def map_text(text):
@@ -492,9 +542,12 @@ def check_mic(args, seconds=4.0):
     heard, conf = transcribe(model, np.clip(resample(a, rate) * gain, -1, 1),
                              want_conf=True)
     key, desc = map_text(heard) if conf["speech"] else ("", "")
+    app_script, app_name = match_app(heard) if conf["speech"] else ("", "")
     print(f"识别：{heard!r}  （增益 {20 * np.log10(gain):.0f}dB, "
           f"no_speech={conf['no_speech']:.2f}）")
-    if key:
+    if app_script:
+        print(f"✓ 会启动应用 {app_name}（{app_script}）")
+    elif key:
         print(f"✓ 会对目标窗口发出 {key!r}（{desc}）")
     elif heard:
         print("△ 听到了但没匹配上指令词（换句更短的，或者说「保存」「暂停」）")
@@ -509,8 +562,14 @@ def run(args):
     from ui_common import wait_key
 
     if args.text:
+        app_script, app_name = match_app(args.text)
         key, desc = map_text(args.text)
-        print(f"「{args.text}」 -> {'按 ' + repr(key) + '（' + desc + '）' if key else '无匹配'}")
+        if app_script:
+            print(f"「{args.text}」 -> 启动应用 {app_name}（{app_script}）")
+        elif key:
+            print(f"「{args.text}」 -> 按键 {key!r}（{desc}）")
+        else:
+            print(f"「{args.text}」 -> 无匹配")
         return
 
     if args.check:
@@ -678,10 +737,11 @@ def run(args):
                     heard = ""
                 hits = match_keys(heard)
                 key, desc = (hits[0][1], hits[0][2]) if len(hits) == 1 else ("", "")
+                app_script, app_name = match_app(heard)
                 if len(hits) > 1:
                     print(f"   命中多个指令 {[h[1] for h in hits]}，先不乱发", flush=True)
                 # 没匹配上 / 有歧义 → 用 small 复核（弱麦克风时 base 常听错）
-                if not key and loud and not args.no_fallback and \
+                if not key and not app_script and loud and not args.no_fallback and \
                         args.model != "small":
                     try:
                         model2 = get_model("small")
@@ -689,23 +749,34 @@ def run(args):
                             model2, np.clip(resample(audio, rate) * gain, -1, 1),
                             want_conf=True)
                         hits2 = match_keys(heard2) if conf2["speech"] else []
+                        app2, app2_name = match_app(heard2) if conf2["speech"] else ("", "")
                         print(f"   复核（small）：{heard2!r} -> "
-                              f"{[h[1] for h in hits2] or '无匹配'}", flush=True)
+                              f"{[h[1] for h in hits2] or app2_name or '无匹配'}", flush=True)
                         if len(hits2) == 1:
                             heard, key, desc = heard2, hits2[0][1], hits2[0][2]
+                        elif app2 and not hits2:
+                            heard, app_script, app_name = heard2, app2, app2_name
                     except Exception as e:                       # noqa: BLE001
                         print(f"复核失败：{e}", flush=True)
                 print(f"[{time.strftime('%H:%M:%S')}] heard={heard!r} "
-                      f"-> {key or '无匹配'}", flush=True)
-                if key and target_hwnd:
+                      f"-> {app_name or key or '无匹配'}", flush=True)
+                acted = False
+                if app_script:
+                    if time.time() >= cool_until:
+                        acted = launch_app(app_script, app_name)
+                        cool_until = time.time() + COOLDOWN_MS / 1000
+                    else:
+                        print("   冷却中，忽略重复启动", flush=True)
+                elif key and target_hwnd:
                     send_key(target_hwnd, key)
                     cool_until = time.time() + COOLDOWN_MS / 1000
                     print(f"   已发送 {key!r} → {target_title}", flush=True)
+                    acted = True
                 elif key:
                     print("   没有目标窗口，按键没发出去（按 t 切换）", flush=True)
-                st.show(target_title, "listen", heard, desc or heard, bool(key),
-                        level, gate, mic=mic_label)
-                last_shown = (target_title, heard, desc, key)
+                st.show(target_title, "listen", heard, app_name or desc or heard,
+                        acted, level, gate, mic=mic_label)
+                last_shown = (target_title, heard, app_name or desc, app_name or key)
                 state = "listen"
                 rec, rec_ms, sil_ms = [], 0.0, 0.0
             else:

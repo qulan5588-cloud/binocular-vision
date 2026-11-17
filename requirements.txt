@@ -11,6 +11,7 @@ onnxruntime-directml==1.24.4    # YOLO 语义分割 app_objects（DirectML 吃 4
 # 会带 CPU 版 onnxruntime 顶掉 directml 的文件（共用模块目录），装完必须
 # 重装：pip install --force-reinstall --no-deps onnxruntime-directml==1.24.4
 faster-whisper==1.2.1           # 语音控制 voice_cmd（base int8 纯 CPU）
+sounddevice                     # 语音控制 voice_cmd 录音必需（缺它启动即 ModuleNotFoundError）
 pyttsx3                         # 仅自测 _detect/voice_e2e 用（系统 TTS 合成音源）
 
 # ---------------------------------------------------------------------------
